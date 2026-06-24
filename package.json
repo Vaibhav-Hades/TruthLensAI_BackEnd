@@ -1,0 +1,37 @@
+{
+  "name": "truthlens-ai-backend",
+  "version": "1.0.0",
+  "description": "TruthLens AI backend API",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "seed": "node seed-supabase.js",
+    "verify-reports": "node verify-reports.js",
+    "test": "node tests/stressTest.js",
+    "test:quick": "node tests/stressTest.js --quick",
+    "test:political": "node tests/stressTest.js --category=1",
+    "test:multilingual": "node tests/stressTest.js --category=3",
+    "test:misinformation": "node tests/stressTest.js --category=5",
+    "test:failures": "node tests/stressTest.js --category=7",
+    "test:performance": "node tests/stressTest.js --category=8",
+    "test:consistency": "node tests/stressTest.js --category=9"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.4",
+    "axios": "^1.6.8",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "form-data": "^4.0.0",
+    "groq-sdk": "^1.1.2",
+    "jsonwebtoken": "^9.0.2",
+    "youtube-captions-scraper": "^2.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.3"
+  }
+}
