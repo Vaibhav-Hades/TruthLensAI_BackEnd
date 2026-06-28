@@ -17,17 +17,17 @@ const translateRoutes = require('./routes/translate')
 const sarvamRoutes    = require('./routes/sarvam')
 
 const app  = express()
-const PORT = process.env.PORT || 5000
+const PORT = process.env.PORT || 10000
 
 // ── Parse allowed origins from environment ────────────────────────────────────
 const getAllowedOrigins = () => {
   const defaultOrigins = [
-    'https://agri-value-connect-frontend.vercel.app',
+    process.env.FRONTEND_URL,
     'http://localhost:3000',
     'http://localhost:5173',
     'http://127.0.0.1:3000',
-    'http://127.0.0.1:5173',
-  ]
+    'http://127.0.0.1:5173'
+].filter(Boolean)
 
   // If CORS_ORIGINS is set in .env, use those (comma-separated)
   if (process.env.CORS_ORIGINS) {
@@ -39,8 +39,11 @@ const getAllowedOrigins = () => {
 
 // ── CORS Configuration ────────────────────────────────────────────────────────
 const allowedOrigins = getAllowedOrigins()
-
+console.log("Allowed Origins:", allowedOrigins)
+console.log("FRONTEND_URL:", process.env.FRONTEND_URL)
+console.log("CORS_ORIGINS:", process.env.CORS_ORIGINS)
 const corsOptions = {
+  
   origin: (origin, callback) => {
     // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true)
