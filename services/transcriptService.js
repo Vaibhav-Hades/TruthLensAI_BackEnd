@@ -59,6 +59,52 @@ async function tryFetchCaptions(videoId) {
   throw lastErr || new Error('No accessible captions found')
 }
 
+const axios = require('axios')
+
+async function fetchYoutubeMetadataFallback(videoId, url) {
+  try {
+    const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
+    const res = await axios.get(oembedUrl, { timeout: 8000 })
+    if (res.data && res.data.title) {
+      const title = res.data.title
+      const author = res.data.author_name || 'YouTube Channel'
+      const content = `Title: ${title}\nAuthor/Publisher: ${author}\nVideo URL: https://www.youtube.com/watch?v=${videoId}`
+      return {
+        transcript: content,
+        transcriptSource: 'youtube-oembed-metadata',
+        languageDetected: 'en',
+        transcriptConfidence: 75,
+        fallbackUsed: true,
+        audioQuality: 'low'
+      }
+    }
+  } catch (err) {
+    console.warn(`[transcript:${videoId}] oEmbed fetch failed: ${err.message}`)
+  }
+
+  try {
+    const noembedUrl = `https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`
+    const res = await axios.get(noembedUrl, { timeout: 8000 })
+    if (res.data && res.data.title) {
+      const title = res.data.title
+      const author = res.data.author_name || 'YouTube Channel'
+      const content = `Title: ${title}\nAuthor/Publisher: ${author}\nVideo URL: https://www.youtube.com/watch?v=${videoId}`
+      return {
+        transcript: content,
+        transcriptSource: 'noembed-metadata',
+        languageDetected: 'en',
+        transcriptConfidence: 75,
+        fallbackUsed: true,
+        audioQuality: 'low'
+      }
+    }
+  } catch (err) {
+    console.warn(`[transcript:${videoId}] NoEmbed fetch failed: ${err.message}`)
+  }
+
+  return null
+}
+
 async function fetchTranscriptWithFallback(url) {
   const videoId = extractVideoId(url)
   if (!videoId) throw new Error('Invalid YouTube URL')
@@ -97,12 +143,25 @@ async function fetchTranscriptWithFallback(url) {
     return audioResult
   } catch (err) {
     // Standardize Errors
-    if (err.message.includes('age-restricted')) {
+    if (err.message.includes('age-restricted') || err.errorCode === 'VIDEO_RESTRICTED') {
       const e = new Error('This video is age-restricted or requires sign-in.')
       e.errorCode = 'VIDEO_RESTRICTED'; e.status = 422; throw e
     }
-    throw err
+    console.warn(`[transcript:${videoId}] Whisper/Audio fallback failed (${err.message}). Attempting metadata fallback...`);
   }
+
+  // Step 3: Metadata Fallback (oEmbed / NoEmbed)
+  try {
+    const metaResult = await fetchYoutubeMetadataFallback(videoId, url)
+    if (metaResult && metaResult.transcript && metaResult.transcript.length >= 20) {
+      setCachedTranscript(videoId, metaResult)
+      return metaResult
+    }
+  } catch (metaErr) {
+    console.error(`[transcript:${videoId}] Metadata fallback failed: ${metaErr.message}`)
+  }
+
+  throw new Error('Unable to extract transcript or content from video. The video may be private, age-restricted, or restricted by YouTube.')
 }
 
 module.exports = { fetchTranscriptWithFallback, extractVideoId }

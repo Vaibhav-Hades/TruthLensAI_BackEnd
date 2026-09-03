@@ -19,21 +19,32 @@ const sarvamRoutes    = require('./routes/sarvam')
 const app  = express()
 const PORT = process.env.PORT || 10000
 
+// ── Helper to normalize origin strings ───────────────────────────────────────
+const normalizeOrigin = (str) => {
+  if (!str || typeof str !== 'string') return ''
+  return str
+    .trim()
+    .replace(/^["']|["']$/g, '') // strip surrounding quotes if any
+    .replace(/\/+$/, '')         // strip trailing slash
+}
+
 // ── Parse allowed origins from environment ────────────────────────────────────
 const getAllowedOrigins = () => {
   const defaultOrigins = [
     process.env.FRONTEND_URL,
+    'https://truth-lens-ai-front-qj0wrw3x-vaibhav-hades-projects-030062f0.vercel.app',
+    'https://truth-lens-ai-front-end.vercel.app',
     'http://localhost:3000',
     'http://localhost:5173',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5173'
-  ].filter(Boolean)
+  ]
 
-  let origins = [...defaultOrigins]
+  let origins = defaultOrigins.map(normalizeOrigin).filter(Boolean)
 
   // If CORS_ORIGINS is set in .env, add those (comma-separated)
   if (process.env.CORS_ORIGINS) {
-    const customOrigins = process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+    const customOrigins = process.env.CORS_ORIGINS.split(',').map(normalizeOrigin).filter(Boolean)
     origins = [...origins, ...customOrigins]
   }
 
@@ -46,21 +57,28 @@ console.log("Allowed Origins:", allowedOrigins)
 console.log("Allowed Origins JSON:", JSON.stringify(allowedOrigins))
 console.log("FRONTEND_URL:", JSON.stringify(process.env.FRONTEND_URL))
 console.log("CORS_ORIGINS:", JSON.stringify(process.env.CORS_ORIGINS))
+
 const corsOptions = {
-  
   origin: (origin, callback) => {
     console.log("Incoming Origin:", JSON.stringify(origin))
     // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true)
 
-    // Allow all Chrome extension origins (popup, content scripts, background)
-    if (origin.startsWith('chrome-extension://')) return callback(null, true)
+    const cleanOrigin = normalizeOrigin(origin)
 
-    // Allow explicitly listed origins
-    if (allowedOrigins.includes(origin)) return callback(null, true)
+    // Allow all Chrome extension origins (popup, content scripts, background)
+    if (cleanOrigin.startsWith('chrome-extension://')) return callback(null, true)
+
+    // Allow explicitly listed origins (normalized)
+    if (allowedOrigins.includes(cleanOrigin)) return callback(null, true)
+
+    // Allow Vercel preview & production deployment URLs (*.vercel.app)
+    if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/i.test(cleanOrigin) || cleanOrigin.endsWith('.vercel.app')) {
+      return callback(null, true)
+    }
 
     console.warn(`CORS request from unauthorized origin: ${origin}`)
-    callback(new Error('CORS not allowed'))
+    return callback(null, false)
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: [
