@@ -12,7 +12,7 @@ const { generateCleanSummary, generateFallbackSummary } = require('./cleanSummar
 const { extractKeywordsAndEntities, localFallbackExtract } = require('./keywordExtractionEngine');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama3-8b-8192';
+const GROQ_MODEL   = 'llama-3.1-8b-instant';
 
 /**
  * Main entry point for Phase 2 Intelligence.
@@ -118,11 +118,12 @@ async function mergeNarrativeMap(chunkAnalyses) {
 /**
  * Advanced Claims Narrative Intelligence Extraction
  * Anchors the claim extraction on the pre-generated clean summary and entities.
+ * NEW: Extracts specific STATEMENTS made by the speaker that can be fact-checked.
  */
 async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResult, keywordResult) {
   const prompt = `
     Persona: Lead Investigative Intelligence Lead.
-    Task: Generate high-fidelity factual claims from source content for verification retrieval.
+    Task: Extract specific STATEMENTS made in the content that can be fact-checked against news sources.
 
     CONTEXTUAL NARRATIVE MAP:
     ${narrativeMap}
@@ -140,15 +141,37 @@ async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResu
     ${text.slice(0, 5000)}
 
     EXTRACTION RULES:
-    1. extractedClaims: Specific factual assertions. Structure: { claim, confidence, entities, narrativeImportance, category }. Focus on the key assertions, political or social topics, and controversial claims discussed in the source content. Every claim MUST be directly related to one or more of our pre-generated semantic entities.
-    2. verdict_label: Provide a high-integrity preliminary verdict (Likely Credible, Questionable, Misleading, Fabricated).
-    3. meaning: The ultimate core takeaway or intent behind the speech/content.
+    1. extractedClaims: Specific STATEMENTS the speaker makes as facts. Each claim must be:
+       - A clear, verifiable assertion (not opinion or speculation)
+       - Something that can be confirmed or refuted by news articles
+       - Structure: { claim, context, confidence, entities, searchQuery, category }
+       - searchQuery: A search query to find articles that verify this specific claim
+    2. videoSummary: A comprehensive summary of what the video/content is ABOUT (the main topic, not just claims)
+    3. verdict_label: Provide a high-integrity preliminary verdict (Likely Credible, Questionable, Misleading, Fabricated)
+    4. meaning: The ultimate core takeaway or intent behind the speech/content
+
+    IMPORTANT: Focus on STATEMENTS THAT CAN BE VERIFIED, not opinions or general commentary.
+    Example GOOD claims:
+    - "The Prime Minister announced new policy X on date Y"
+    - "Company ABC reported revenue of $Z billion in Q3"
+    - "The earthquake measured 7.2 on the Richter scale"
+    Example BAD claims (opinions, not verifiable):
+    - "This policy is good for the economy"
+    - "People are angry about this"
 
     RETURN ONLY JSON:
     {
       "extractedClaims": [
-        { "claim": "...", "confidence": 95, "entities": ["..."], "narrativeImportance": 90, "category": "Political|Economic|Security" }
+        { 
+          "claim": "Specific verifiable statement made by the speaker",
+          "context": "Brief context of when/how this was stated",
+          "confidence": 95,
+          "entities": ["Person/Org/Location mentioned"],
+          "searchQuery": "specific search terms to find verifying articles",
+          "category": "Political|Economic|Health|Security|Technology|Social"
+        }
       ],
+      "videoSummary": "Comprehensive summary of what the video is about (2-3 sentences)",
       "verdict_label": "Likely Credible|Questionable|Misleading|Fabricated",
       "meaning": "The ultimate narrative takeaway."
     }
@@ -160,7 +183,7 @@ async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResu
 
     return {
       // Legacy Fields (strictly required by credibilityService, analyzeController, etc.)
-      summary: cleanSummaryResult.cleanSummary,
+      summary: parsed.videoSummary || cleanSummaryResult.cleanSummary,
       meaning: parsed.meaning || cleanSummaryResult.contextualNarrative.split('.')[0] || cleanSummaryResult.cleanSummary.split('.')[0],
       entities: keywordResult.extractedEntities,
       keywords: keywordResult.extractedKeywords,
@@ -178,6 +201,7 @@ async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResu
       extractedKeywords: keywordResult.extractedKeywords,
       extractedEntities: keywordResult.extractedEntities,
       extractedClaims: parsed.extractedClaims || [],
+      videoSummary: parsed.videoSummary || cleanSummaryResult.cleanSummary,
       narrativeTopics: keywordResult.narrativeTopics,
       retrievalSignals: keywordResult.retrievalSignals,
       keywordRelevance: keywordResult.keywordRelevance,

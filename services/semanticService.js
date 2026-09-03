@@ -9,15 +9,73 @@ const { robustFetch } = require('../utils/apiClient');
 const logger = require('../utils/pipelineLogger');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama3-8b-8192';
+const GROQ_MODEL   = 'llama-3.1-8b-instant';
 
 /**
  * Main Entry Point for Phase 4: Streamlined Semantic Audit
+ * NEW: Includes per-claim verification results from Phase 3
  */
-async function runSemanticVerification(claims, evidenceArticles, originalSummary) {
+async function runSemanticVerification(claims, evidenceArticles, originalSummary, claimVerifications = []) {
   const startTime = Date.now();
   const groqKey = process.env.GROQ_API_KEY;
 
+  // If we have claim verifications from Phase 3, use them directly
+  if (claimVerifications && claimVerifications.length > 0) {
+    console.log('[semantic:v4] 📊 Using per-claim verification results from Phase 3...');
+    
+    // Calculate aggregate scores from claim verifications
+    const supported = claimVerifications.filter(c => c.verdict === 'SUPPORTED').length;
+    const refuted = claimVerifications.filter(c => c.verdict === 'REFUTED').length;
+    const unverified = claimVerifications.filter(c => c.verdict === 'UNVERIFIED').length;
+    const total = claimVerifications.length;
+    
+    // Calculate alignment based on claim verdicts
+    const alignment = total > 0 
+      ? Math.round((supported / total) * 100) 
+      : (evidenceArticles && evidenceArticles.length > 0 ? 40 : 10);
+    
+    // Determine contradiction level
+    let contradictionLevel = 'none';
+    if (refuted > supported) contradictionLevel = 'high';
+    else if (refuted > 0) contradictionLevel = 'moderate';
+    else if (supported > 0) contradictionLevel = 'low';
+    
+    // Determine consensus state
+    let consensusState = 'Insufficient Coverage';
+    if (supported >= 2 && refuted === 0) consensusState = 'Strongly Supported';
+    else if (supported >= 1 && refuted === 0) consensusState = 'Partially Verified';
+    else if (refuted > 0 && supported === 0) consensusState = 'Contradicted';
+    else if (refuted > 0 && supported > 0) consensusState = 'Mixed Evidence';
+    else if (unverified > 0) consensusState = 'Unverified';
+    
+    // Build reasoning from claim verdicts
+    const reasoningParts = [];
+    if (supported > 0) reasoningParts.push(`${supported} claim(s) verified by external sources`);
+    if (refuted > 0) reasoningParts.push(`${refuted} claim(s) contradicted by external sources`);
+    if (unverified > 0) reasoningParts.push(`${unverified} claim(s) could not be verified`);
+    
+    const durationMs = Date.now() - startTime;
+    
+    return {
+      narrativeAlignment: alignment,
+      contradictionLevel,
+      consensusState,
+      semanticConfidence: Math.min(100, Math.max(20, alignment + 10)),
+      narrativeReasoning: reasoningParts.join('. ') + '.',
+      claimVerifications, // Pass through the per-claim results
+      supportingSources: evidenceArticles.filter(a => a.stance === 'support'),
+      contradictingSources: evidenceArticles.filter(a => a.stance === 'refute'),
+      metadata: { 
+        processingTimeMs: durationMs,
+        claimsVerified: total,
+        supported,
+        refuted,
+        unverified
+      }
+    };
+  }
+
+  // Fallback: Original holistic audit if no claim verifications
   if (!groqKey || !evidenceArticles || evidenceArticles.length === 0) {
     return getFallbackVerificationSignals(evidenceArticles);
   }

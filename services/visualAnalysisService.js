@@ -11,7 +11,7 @@
 const axios = require('axios')
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL   = 'llama3-8b-8192'
+const GROQ_MODEL   = 'llama-3.1-8b-instant'
 
 // ── Fetch YouTube metadata via oEmbed (free, no API key) ─────────────────────
 
