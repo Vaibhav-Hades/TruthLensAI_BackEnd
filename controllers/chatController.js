@@ -11,15 +11,21 @@ const chat = async function(req, res, next) {
     }
 
     // Support both old shape (summary/meaning/...) and new shape (analysisContext)
-    const ctx = analysisContext || {
+    let ctx = analysisContext || {
       summary:        req.body.summary,
       meaning:        req.body.meaning,
       truthScore:     req.body.truthScore,
       matchedSources: req.body.matchedSources,
     }
 
-    if (!ctx.summary && !ctx.meaning) {
-      return res.status(400).json({ error: 'Analysis context is required.' })
+    // Fallback context for general queries when no video has been analyzed yet
+    if (!ctx || (!ctx.summary && !ctx.meaning)) {
+      ctx = {
+        summary: 'General inquiry about TruthLens AI news verification platform.',
+        meaning: 'General assistance',
+        truthScore: 50,
+        matchedSources: []
+      }
     }
 
     const answer = await generateAnswer(q, ctx, history || [], language || 'en')
