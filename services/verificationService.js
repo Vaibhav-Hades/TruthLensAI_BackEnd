@@ -75,7 +75,7 @@ async function performFullVerification(pipelineResult) {
         ...pipelineResult.metadata,
         processingTimeMs: durationMs,
         pipelineVersion: 'V2-Simplified-Stable',
-        model: 'llama3-8b-8192'
+        model: 'llama-3.1-8b-instant'
       }
     };
 

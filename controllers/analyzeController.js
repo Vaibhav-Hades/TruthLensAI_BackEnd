@@ -64,7 +64,8 @@ async function analyzeVideo(req, res, next) {
     const semanticSignals = await runSemanticVerification(
       intelligence.extractedClaims || intelligence.claims || [],
       liveNarrative.articleSummaries || [],
-      intelligence.humanizedSummary || intelligence.summary
+      intelligence.humanizedSummary || intelligence.summary,
+      liveNarrative.claimVerifications || [] // Pass claim verifications from Phase 3
     );
     stageTimings['semantic_audit'] = Date.now() - startP4;
 
@@ -103,11 +104,14 @@ async function analyzeVideo(req, res, next) {
 
     return res.status(200).json({
       summary: report.summary,
+      videoSummary: report.videoSummary || report.summary,
       meaning: intelligence.meaning,
       keywords: intelligence.keywords || [],
       claims: intelligence.extractedClaims || intelligence.claims || [],
+      claimVerifications: report.claimVerifications || [], // NEW: Per-claim verification results
       explanation: report.reasoning,
       verdict_label: report.verdict,
+      verdict: report.verdict, // frontend Results.jsx expects `verdict`
       truthScore: report.credibilityScore,
       scoreConfidence: report.confidence,
       matchedSources: matchedSources,

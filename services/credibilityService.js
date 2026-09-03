@@ -10,7 +10,7 @@
 const { robustFetch } = require('../utils/apiClient');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama3-8b-8192';
+const GROQ_MODEL   = 'llama-3.1-8b-instant';
 
 /**
  * Main Entry Point for Phase 5 V2: Credibility & Verdict Synthesis
@@ -70,9 +70,11 @@ async function generateCredibilityReport(pipelineData) {
 
   return {
     summary: intelligence.summary,
+    videoSummary: intelligence.videoSummary || intelligence.summary,
     entities: intelligence.entities,
     keywords: intelligence.keywords,
     claims: intelligence.claims,
+    claimVerifications: semanticSignals?.claimVerifications || [], // NEW: Per-claim verification results
     supportingArticles: liveNarrative.supportingArticles || [],
     contradictingArticles: liveNarrative.contradictingArticles || [],
     narrativeAlignment: alignment,
@@ -83,8 +85,9 @@ async function generateCredibilityReport(pipelineData) {
     reasoning,
     metadata: {
       processedAt: new Date().toISOString(),
-      version: '2.0.0-Verdict',
-      sourceTraceability: `Verified against ${liveNarrative.articleSummaries?.length || 0} external reports.`
+      version: '3.0.0-ClaimVerification',
+      sourceTraceability: `Verified against ${liveNarrative.articleSummaries?.length || 0} external reports.`,
+      claimsVerified: (semanticSignals?.claimVerifications || []).length
     }
   };
 }

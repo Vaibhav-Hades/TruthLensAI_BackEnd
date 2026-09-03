@@ -27,14 +27,17 @@ const getAllowedOrigins = () => {
     'http://localhost:5173',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5173'
-].filter(Boolean)
+  ].filter(Boolean)
 
-  // If CORS_ORIGINS is set in .env, use those (comma-separated)
+  let origins = [...defaultOrigins]
+
+  // If CORS_ORIGINS is set in .env, add those (comma-separated)
   if (process.env.CORS_ORIGINS) {
-    return process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+    const customOrigins = process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+    origins = [...origins, ...customOrigins]
   }
 
-  return defaultOrigins
+  return [...new Set(origins)]
 }
 
 // ── CORS Configuration ────────────────────────────────────────────────────────

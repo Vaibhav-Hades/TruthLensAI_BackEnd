@@ -14,7 +14,7 @@ const { robustFetch } = require('../utils/apiClient');
 const cache = require('./cacheService');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama3-8b-8192';
+const GROQ_MODEL   = 'llama-3.1-8b-instant';
 
 // Standard English stopwords plus weak conversational words to completely remove (Step 2)
 const STOPWORDS = new Set([

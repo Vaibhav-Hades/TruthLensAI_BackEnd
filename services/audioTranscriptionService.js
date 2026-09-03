@@ -33,7 +33,7 @@ async function checkTool(name) {
 }
 
 // ── Step 1: Download Audio ────────────────────────────────────────────────────
-async function downloadRawAudio(videoUrl) {
+async function downloadRawAudio(videoUrl, playerClient) {
   const tmpDir = os.tmpdir()
   const dlDir  = path.join(tmpDir, `tl_forensic_${Date.now()}_${Math.floor(Math.random()*1000)}`)
   if (!fs.existsSync(dlDir)) fs.mkdirSync(dlDir, { recursive: true })
@@ -50,28 +50,67 @@ async function downloadRawAudio(videoUrl) {
     '--no-warnings',
     '--no-part',
     '--retries', '3',
-    '--fragment-retries', '5'
+    '--fragment-retries', '5',
+    '--extractor-retries', '3',
+    '--socket-timeout', '20'
   ]
+
+  // YouTube frequently 403s the default web player client (bot detection).
+  // Fall back to alternate player clients which bypass the block.
+  if (playerClient) {
+    args.push('--extractor-args', `youtube:player_client=${playerClient}`)
+  }
+
+  // Optional cookies file (e.g. YTDLP_COOKIES=/path/to/cookies.txt) resolves
+  // the most aggressive YouTube bot checks. Never required for basic use.
+  if (process.env.YTDLP_COOKIES) {
+    args.push('--cookies', process.env.YTDLP_COOKIES)
+  }
 
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP_BIN, args)
+    proc.on('error', err => {
+      // Surface missing-binary errors clearly instead of a generic message
+      reject(Object.assign(new Error('yt-dlp is not available on this machine. Install it and ensure it is on PATH.'), {
+        errorCode: 'YTDLP_MISSING',
+        status: 500,
+        cause: err
+      }))
+    })
     let stderr = ''
     proc.stderr.on('data', d => { stderr += d.toString() })
     proc.on('close', code => {
       const full = stderr.toLowerCase()
-      if (full.includes('duration')) {
+
+      // ── Known policy failures ──
+      if (full.includes('duration') && full.includes('match')) {
         return reject(Object.assign(new Error(`Video exceeds ${MAX_DURATION_SEC/60}m limit.`), { errorCode: 'VIDEO_TOO_LONG', status: 422 }))
       }
-      if (full.includes('age-restricted') || full.includes('sign in')) {
+      if (full.includes('age-restricted') || full.includes('sign in') || full.includes('private video')) {
         return reject(Object.assign(new Error('Video is age-restricted or requires sign-in.'), { errorCode: 'VIDEO_RESTRICTED', status: 422 }))
       }
+      if (full.includes('video unavailable') || full.includes('not available') || full.includes('playable')) {
+        return reject(Object.assign(new Error('Video is unavailable or cannot be played.'), { errorCode: 'VIDEO_UNAVAILABLE', status: 422 }))
+      }
 
-      // Dynamic detection of downloaded file
+      // Exit code 101 = "--max-downloads reached" — that is a SUCCESS here.
+      // Any other non-zero exit means the real failure is in stderr: surface it.
+      if (code !== 0 && code !== 101) {
+        const reason = stderr.trim().split(/\r?\n/).filter(Boolean).slice(-4).join(' | ').slice(0, 500)
+        return reject(Object.assign(new Error('Audio download failed: ' + (reason || `yt-dlp exited with code ${code}`)), {
+          errorCode: 'AUDIO_DOWNLOAD_FAILED',
+          status: 502
+        }))
+      }
+
+      // ── Success path: dynamic detection of the downloaded file ──
       try {
-        const files = fs.readdirSync(dlDir).filter(f => fs.statSync(path.join(dlDir, f)).size > 1024)
-        if (files.length > 0) resolve(path.join(dlDir, files[0]))
-        else reject(new Error('No audio file found after download.'))
-      } catch (e) { reject(e) }
+        const files = fs.readdirSync(dlDir).filter(f => {
+          try { return fs.statSync(path.join(dlDir, f)).size > 1024 } catch (_) { return false }
+        })
+        if (files.length > 0) return resolve(path.join(dlDir, files[0]))
+      } catch (e) { /* fall through to generic error */ }
+      reject(new Error('No audio file found after download.'))
     })
   })
 }
@@ -107,6 +146,7 @@ async function processAudioWithFfmpeg(rawPath) {
     ]
 
     const proc = spawn(FFMPEG_BIN, args)
+    proc.on('error', reject)
     let stderr = ''
     proc.stderr.on('data', d => { stderr += d.toString() })
     proc.on('close', code => {
@@ -160,7 +200,20 @@ async function transcribeFromAudio(videoUrl) {
   let rawPath = null, processedPath = null, dlDir = null;
 
   try {
-    rawPath = await downloadRawAudio(videoUrl)
+    // Try the default player client first, then fall back to alternate clients
+    // which are not affected by YouTube's 403 bot protection.
+    let downloadError = null
+    for (const client of [null, 'android', 'web_safari', 'tv']) {
+      try {
+        rawPath = await downloadRawAudio(videoUrl, client)
+        break
+      } catch (err) {
+        downloadError = err
+        console.warn(`[audio-download] player client '${client || 'default'}' failed: ${err.message}`)
+        if (err.errorCode === 'VIDEO_TOO_LONG' || err.errorCode === 'VIDEO_RESTRICTED') throw err
+      }
+    }
+    if (!rawPath) throw downloadError || new Error('No audio file found after download.')
     dlDir = path.dirname(rawPath)
     
     processedPath = await processAudioWithFfmpeg(rawPath)

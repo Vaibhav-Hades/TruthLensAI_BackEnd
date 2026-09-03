@@ -93,7 +93,7 @@ const localFallback = function(transcript) {
 // ── Groq LLM (primary) ────────────────────────────────────────────────────────
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL   = 'llama3-8b-8192'
+const GROQ_MODEL   = 'llama-3.1-8b-instant'
 
 const summarizeWithGroq = async function(transcript) {
   const cacheKey = cache.generateKey('summary_v3', transcript);

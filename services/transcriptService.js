@@ -1,8 +1,22 @@
 const { getSubtitles } = require('youtube-captions-scraper')
+const cache = require('./cacheService')
 
 /**
  * PHASE 1 V2 REFINED: High-Reliability Transcript Engine
  */
+
+// In-memory transcript cache keyed by video ID.
+// Re-analyzing the same video skips caption scraping / audio download entirely,
+// which avoids repeat YouTube requests (and their 403 rate-limit blocks).
+const TRANSCRIPT_TTL_MS = 1000 * 60 * 60 * 6 // 6 hours
+
+function getCachedTranscript(videoId) {
+  return cache.get(cache.generateKey('transcript_v1', videoId))
+}
+
+function setCachedTranscript(videoId, value) {
+  cache.set(cache.generateKey('transcript_v1', videoId), value, TRANSCRIPT_TTL_MS)
+}
 
 const LANG_FALLBACKS = [
   { code: 'en', label: 'English (Manual)', priority: 1 },
@@ -49,11 +63,18 @@ async function fetchTranscriptWithFallback(url) {
   const videoId = extractVideoId(url)
   if (!videoId) throw new Error('Invalid YouTube URL')
 
+  // Cache hit — skip caption scraping and audio download entirely
+  const cached = getCachedTranscript(videoId)
+  if (cached) {
+    console.info(`[transcript:${videoId}] Using cached transcript (${cached.transcriptSource}).`)
+    return cached
+  }
+
   // Step 1: Attempt Captions (Prefer Manual -> Auto)
   try {
     const result = await tryFetchCaptions(videoId)
     if (result.text && result.text.length > 50) {
-      return {
+      const value = {
         transcript: result.text,
         transcriptSource: result.isAuto ? 'youtube-auto-captions' : 'youtube-manual-captions',
         languageDetected: result.language,
@@ -61,6 +82,8 @@ async function fetchTranscriptWithFallback(url) {
         fallbackUsed: false,
         audioQuality: 'high' // Captions imply good digital source
       }
+      setCachedTranscript(videoId, value)
+      return value
     }
   } catch (e) {
     console.info(`[transcript:${videoId}] Captions unavailable or restricted. Initiating Whisper AI fallback...`);
@@ -70,6 +93,7 @@ async function fetchTranscriptWithFallback(url) {
   const { transcribeFromAudio } = require('./audioTranscriptionService')
   try {
     const audioResult = await transcribeFromAudio(url)
+    setCachedTranscript(videoId, audioResult)
     return audioResult
   } catch (err) {
     // Standardize Errors
