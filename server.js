@@ -43,11 +43,13 @@ const getAllowedOrigins = () => {
 // ── CORS Configuration ────────────────────────────────────────────────────────
 const allowedOrigins = getAllowedOrigins()
 console.log("Allowed Origins:", allowedOrigins)
-console.log("FRONTEND_URL:", process.env.FRONTEND_URL)
-console.log("CORS_ORIGINS:", process.env.CORS_ORIGINS)
+console.log("Allowed Origins JSON:", JSON.stringify(allowedOrigins))
+console.log("FRONTEND_URL:", JSON.stringify(process.env.FRONTEND_URL))
+console.log("CORS_ORIGINS:", JSON.stringify(process.env.CORS_ORIGINS))
 const corsOptions = {
   
   origin: (origin, callback) => {
+    console.log("Incoming Origin:", JSON.stringify(origin))
     // Allow requests with no origin (curl, Postman, mobile apps)
     if (!origin) return callback(null, true)
 
