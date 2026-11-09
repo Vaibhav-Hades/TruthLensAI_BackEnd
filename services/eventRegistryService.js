@@ -12,6 +12,7 @@
  */
 
 const { robustFetch } = require('../utils/apiClient');
+const { searchNews, enrichBodies } = require('./webSearchService');
 const logger = require('../utils/pipelineLogger');
 const { GROQ_API_URL, GROQ_MODEL } = require('../config/llm');
 
@@ -38,11 +39,6 @@ function isPremium(domain) {
 async function analyzeLiveNarrative(pipelineInput, intelligence) {
   const startTime = Date.now();
 
-  if (!getErKey()) {
-    console.warn('[retrieval] ER_API_KEY is not set - live evidence retrieval skipped.');
-    return getEmptyEvidenceResult('er_key_missing', claimsOf(intelligence));
-  }
-
   try {
     const claims = claimsOf(intelligence);
     const erState = { errors: [], calls: 0 };
@@ -53,8 +49,9 @@ async function analyzeLiveNarrative(pipelineInput, intelligence) {
       if (!articles.length) {
         return { articles: [], verification: unverified(claim, 'No relevant news articles were found for this claim.') };
       }
-      const verification = await verifyClaimAgainstArticles(claim, articles);
-      return { articles, verification };
+      const enriched = await enrichBodies(articles, 3);   // read real article text where possible
+      const verification = await verifyClaimAgainstArticles(claim, enriched);
+      return { articles: enriched, verification };
     }));
 
     const claimVerifications = perClaim.map(p => p.verification);
@@ -63,12 +60,12 @@ async function analyzeLiveNarrative(pipelineInput, intelligence) {
     // General topical search for context panels.
     const generalQuery = buildSimpleQuery(intelligence);
     if (generalQuery.keyword.length) {
-      allRawArticles.push(...await fetchArticlesFromER(generalQuery, erState));
+      allRawArticles.push(...await fetchArticles(generalQuery, erState));
     }
 
     const uniqueArticles = deduplicateArticles(allRawArticles);
     const retrievalStatus = erState.errors.length && erState.errors.length >= erState.calls
-      ? `er_error:${erState.errors[0]}`
+      ? `search_error:${erState.errors[0]}`
       : 'ok';
 
     if (uniqueArticles.length === 0) {
@@ -93,6 +90,7 @@ async function analyzeLiveNarrative(pipelineInput, intelligence) {
         searchQueryUsed: generalQuery.keyword.join(' '),
         processingTimeMs: durationMs,
         claimsProcessed: claimVerifications.length,
+        provider: erState.provider || null,
         erCalls: erState.calls,
         erErrors: erState.errors.length
       }
@@ -118,9 +116,14 @@ function unverified(claim, reasoning) {
 async function searchForClaim(claim, intelligence, erState) {
   const terms = claimSearchTerms(claim);
   if (!terms.length) return [];
-  let articles = await fetchArticlesFromER(erQuery(terms, 'and', 10), erState);
+  let articles = await fetchArticles(erQuery(terms, 'and', 10), erState);
   if (articles.length < 2 && terms.length > 1) {
-    articles = articles.concat(await fetchArticlesFromER(erQuery(terms, 'or', 10), erState));
+    articles = articles.concat(await fetchArticles(erQuery(terms, 'or', 10), erState));
+  }
+  // Third attempt: the claim's own wording as a plain phrase query (works best for keyless web search).
+  if (articles.length < 3) {
+    const phrase = String(claim.searchQuery || claim.claim || '').split(/\s+/).slice(0, 12).join(' ');
+    if (phrase.length > 8) articles = articles.concat(await fetchArticles(erQuery([phrase.replace(/"/g, '')], 'and', 10), erState));
   }
   return deduplicateArticles(articles);
 }
@@ -234,6 +237,28 @@ function deduplicateArticles(articles) {
   });
 }
 
+/**
+ * Retrieval with automatic fallback: Event Registry (if ER_API_KEY is set) -> keyless web news search.
+ * A failure is only recorded when no provider could answer.
+ */
+async function fetchArticles(query, erState) {
+  const local = { errors: [], calls: 0 };
+  if (getErKey()) {
+    const r = await fetchArticlesFromER(query, local);
+    if (r.length) { erState.calls++; erState.provider = 'event-registry'; return r; }
+  }
+  erState.calls++;
+  try {
+    const lang = (query.lang && query.lang[0]) || 'eng';
+    const r = await searchNews(query.keyword, query.keywordOper, lang, Math.min(query.articlesCount || 10, 15));
+    if (r.length) erState.provider = erState.provider || 'web-search';
+    return r;
+  } catch (e) {
+    erState.errors.push(`web_search:${e.response?.status ? 'http_' + e.response.status : e.message}`.slice(0, 120));
+    return [];
+  }
+}
+
 /** Calls Event Registry. Never throws; records failures in erState. */
 async function fetchArticlesFromER(query, erState = { errors: [], calls: 0 }) {
   erState.calls++;
@@ -321,7 +346,7 @@ Article Content: ${(article.body || '').slice(0, 1800)}
 
 TASK
 1. Summarize in 1-2 sentences how the article relates to the summary.
-2. stance: "support" only if the article confirms facts in the summary, "refute" only if it directly conflicts with them, otherwise "neutral" (same topic is neutral).
+2. stance: "support" only if the article confirms a specific fact in the summary about the same event. "refute" only if it explicitly states the opposite of a specific fact in the summary about the SAME event and time. Articles about a different date, a later or earlier event, or merely the same topic are "neutral".
 
 RETURN JSON ONLY:
 {"text":"...","stance":"support|refute|neutral","alignmentStatus":"Aligned|Contradicting|Contextual"}`;
@@ -369,4 +394,4 @@ function getEmptyEvidenceResult(retrievalStatus, claims = []) {
   };
 }
 
-module.exports = { analyzeLiveNarrative, fetchArticlesFromER, verifyClaimAgainstArticles, claimSearchTerms };
+module.exports = { analyzeLiveNarrative, fetchArticlesFromER, fetchArticles, verifyClaimAgainstArticles, claimSearchTerms };

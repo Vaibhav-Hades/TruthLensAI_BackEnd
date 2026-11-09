@@ -18,6 +18,8 @@ const scenario = {
   erHttpStatus: 200,
   pages: {},                        // url -> { status, contentType, body }
   rssError: false,
+  webError: false,
+  bing: '<rss><channel><item><title>RBI hikes repo rate by 25 bps</title><link>http://www.bing.com/news/apiclick.aspx?ref=x&amp;url=https%3a%2f%2fwww.thehindu.com%2fa1&amp;c=1</link><description>The Reserve Bank of India raised the repo rate by 25 basis points on Wednesday.</description><pubDate>Wed, 08 Feb 2023 05:00:00 GMT</pubDate><News:Source>The Hindu</News:Source></item></channel></rss>',
   rss: '<rss><channel><item><title>Rates rise again - Reuters</title><link>https://news.example.com/1</link><pubDate>Mon, 09 Nov 2026 10:00:00 GMT</pubDate><source url="https://reuters.com">Reuters</source></item><item><title>Older story - The Hindu</title><link>https://news.example.com/2</link><pubDate>Mon, 09 Nov 2026 08:00:00 GMT</pubDate><source url="https://thehindu.com">The Hindu</source></item><item><title>Rates rise again - Reuters</title><link>https://news.example.com/3</link><pubDate>Mon, 09 Nov 2026 09:00:00 GMT</pubDate><source url="https://reuters.com">Reuters</source></item></channel></rss>',
   calls: [],
 }
@@ -32,6 +34,7 @@ function reset() {
   scenario.erHttpStatus = 200
   scenario.pages = {}
   scenario.rssError = false
+  scenario.webError = false
   scenario.calls = []
 }
 
@@ -90,6 +93,11 @@ async function adapter(config) {
     }
     // Everything else (summary engine, keyword engine, ...): 400 => no retry => deterministic NLP fallback.
     throw httpError(config, 400, { error: 'not mocked' })
+  }
+
+  if (url.includes('bing.com/news/search')) {
+    if (scenario.webError) throw httpError(config, 503, '')
+    return ok(config, scenario.bing, { 'content-type': 'application/rss+xml' })
   }
 
   if (url.includes('news.google.com/rss')) {

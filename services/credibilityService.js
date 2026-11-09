@@ -82,7 +82,7 @@ async function generateHumanizedReasoning(data) {
   };
 
   const prompt = `You are a news editor. Write a short explanation (max 4 sentences, plain language, no jargon) of this fact-check outcome.
-Use ONLY the facts below. Do not change or second-guess the prediction, and do not invent sources or numbers.
+Use ONLY the facts below. Do not change or second-guess the prediction. Do not invent sources, numbers, dates or counts, and do not say how many articles supported or contradicted anything unless that number is in the facts. Only restate details that appear in the claims below.
 If there was little evidence, say verification was limited. Mention that only the title was analysed ONLY when onlyTitleWasAnalysed is true; otherwise never mention metadata. If news retrieval was unavailable (see reason), say the claims could not be checked against news reports. Refer to claims as claims, not as evidence.
 
 FACTS: ${JSON.stringify(facts)}`;

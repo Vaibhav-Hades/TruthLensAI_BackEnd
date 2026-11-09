@@ -26,7 +26,7 @@ Frontend: `cd ../Frontend && npm install && npm run dev` (uses `.env.development
 | `JWT_SECRET` | prod | Signs login tokens |
 | `GROQ_API_KEY` | yes (AI) | LLM claim extraction / stance checking / chat / translation / Whisper |
 | `GROQ_MODEL` | no | Default `openai/gpt-oss-20b` (the old `llama-3.1-8b-instant` is retired → 404) |
-| `ER_API_KEY` | yes (evidence) | Event Registry. Without it retrieval is skipped and results are INCONCLUSIVE |
+| `ER_API_KEY` | no (optional) | Event Registry. Without it, evidence comes from keyless Bing News RSS + the article pages themselves (`services/webSearchService.js`); it is also the automatic fallback if Event Registry errors |
 | `FRONTEND_URL`, `CORS_ORIGINS` | prod | Allowed browser origins (merged with localhost dev origins) |
 | `CORS_ALLOW_VERCEL_PREVIEWS`, `CORS_VERCEL_PATTERN` | no | Vercel preview-URL policy (default: `^https://truth-?lens…\.vercel\.app$`) |
 | `YTDLP_PATH`, `FFMPEG_PATH` | Windows only | Full paths if not on PATH |

@@ -174,16 +174,16 @@ test('analyze text: model verdict WITHOUT citing an article is discarded', async
   assert.equal(r.json.claimVerifications[0].verdict, 'UNVERIFIED')
 })
 
-test('analyze text: Event Registry API error (bad key / quota) => INCONCLUSIVE and reported, not 500', async () => {
-  scenario.erError = 'Invalid API key'
+test('analyze text: every provider erroring => INCONCLUSIVE and reported, not 500', async () => {
+  scenario.erError = 'Invalid API key'; scenario.webError = true
   const r = await post('/api/analyze', { url: TEXT })
   assert.equal(r.status, 200)
   assert.equal(r.json.prediction, 'INCONCLUSIVE')
-  assert.match(r.json.retrievalStatus, /er_error/)
+  assert.match(r.json.retrievalStatus, /search_error/)
 })
 
-test('analyze text: Event Registry HTTP 500 => INCONCLUSIVE, not 500', async () => {
-  scenario.erHttpStatus = 400
+test('analyze text: Event Registry HTTP error and web down => INCONCLUSIVE, not 500', async () => {
+  scenario.erHttpStatus = 400; scenario.webError = true
   const r = await post('/api/analyze', { url: TEXT })
   assert.equal(r.status, 200)
   assert.equal(r.json.prediction, 'INCONCLUSIVE')
@@ -197,15 +197,36 @@ test('analyze text: LLM completely unavailable => still 200 and INCONCLUSIVE (de
   assert.ok(r.json.explanation.length > 20)
 })
 
-test('analyze text: missing ER_API_KEY => retrieval skipped, INCONCLUSIVE, key is never hard-coded', async () => {
+test('analyze text: no ER_API_KEY => keyless web search is used and results are still evidence-based', async () => {
   const saved = process.env.ER_API_KEY
   delete process.env.ER_API_KEY
   try {
     const r = await post('/api/analyze', { url: TEXT })
     assert.equal(r.status, 200)
-    assert.equal(r.json.retrievalStatus, 'er_key_missing')
-    assert.equal(r.json.prediction, 'INCONCLUSIVE')
+    assert.equal(r.json.retrievalStatus, 'ok')
+    assert.equal(r.json.prediction, 'REAL')
     assert.ok(!scenario.calls.some(c => c.url.includes('eventregistry')), 'must not call Event Registry without a key')
+    assert.ok(scenario.calls.some(c => c.url.includes('bing.com/news')), 'web search used')
+    assert.equal(r.json.matched_text[0].url, 'https://www.thehindu.com/a1', 'real publisher URL decoded from the redirect link')
+  } finally { process.env.ER_API_KEY = saved }
+})
+
+test('analyze text: Event Registry failing falls back to web search', async () => {
+  scenario.erError = 'Invalid API key'
+  const r = await post('/api/analyze', { url: TEXT })
+  assert.equal(r.json.retrievalStatus, 'ok')
+  assert.equal(r.json.prediction, 'REAL')
+})
+
+test('analyze text: no key and web search down => INCONCLUSIVE with the reason, not a 500', async () => {
+  const saved = process.env.ER_API_KEY
+  delete process.env.ER_API_KEY
+  scenario.webError = true
+  try {
+    const r = await post('/api/analyze', { url: TEXT })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.prediction, 'INCONCLUSIVE')
+    assert.match(r.json.retrievalStatus, /search_error/)
   } finally { process.env.ER_API_KEY = saved }
 })
 
