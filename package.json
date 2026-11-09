@@ -9,14 +9,15 @@
     "dev": "nodemon server.js",
     "seed": "node seed-supabase.js",
     "verify-reports": "node verify-reports.js",
-    "test": "node tests/stressTest.js",
+    "test": "node --test \"tests/unit/*.test.js\"",
     "test:quick": "node tests/stressTest.js --quick",
     "test:political": "node tests/stressTest.js --category=1",
     "test:multilingual": "node tests/stressTest.js --category=3",
     "test:misinformation": "node tests/stressTest.js --category=5",
     "test:failures": "node tests/stressTest.js --category=7",
     "test:performance": "node tests/stressTest.js --category=8",
-    "test:consistency": "node tests/stressTest.js --category=9"
+    "test:consistency": "node tests/stressTest.js --category=9",
+    "test:stress": "node tests/stressTest.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.4",
@@ -33,5 +34,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.1.3"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

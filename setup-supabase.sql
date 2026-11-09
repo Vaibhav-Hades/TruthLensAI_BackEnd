@@ -75,3 +75,33 @@ CREATE POLICY "Sources are publicly readable" ON sources
 -- Only service role can modify sources
 CREATE POLICY "Only service role can modify sources" ON sources
   FOR ALL USING (auth.role() = 'service_role');
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Additions required by the current backend code
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- authController.signup stores these optional profile fields.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role     VARCHAR(80);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone    VARCHAR(40);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(120);
+
+-- Anonymous log of completed analyses (no content stored). Powers /api/admin/dashboard.
+CREATE TABLE IF NOT EXISTS analyses (
+  id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  input_ref     VARCHAR(300),
+  content_type  VARCHAR(20),
+  prediction    VARCHAR(20),
+  truth_score   INTEGER,
+  confidence    INTEGER,
+  created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at DESC);
+
+-- IMPORTANT (Row Level Security)
+-- This backend authenticates users itself (bcrypt + JWT) and never uses Supabase Auth, so auth.uid()
+-- is NULL for its requests and the policies above would reject its writes if it connects with the
+-- anon key. Set SUPABASE_SERVICE_ROLE_KEY on the backend (server-side only). The service-role key
+-- bypasses RLS. Keep RLS enabled so the public anon key (which ships in the frontend bundle) cannot
+-- read or write these tables directly.
+ALTER TABLE analyses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE flags    ENABLE ROW LEVEL SECURITY;

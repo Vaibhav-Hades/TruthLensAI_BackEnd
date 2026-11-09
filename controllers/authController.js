@@ -144,18 +144,30 @@ const getProfile = async function(req, res, next) {
     // req.user is set by authMiddleware (Supabase row, no password)
     const user = req.user
 
+    const { data: reports, error } = await supabase
+      .from('reports')
+      .select('id, url, truth_score, summary, created_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+      .limit(200)
+    if (error) console.warn('Profile stats query failed:', error.message)
+
+    const list  = reports || []
+    const total = list.length
     return res.status(200).json({
       id:        user.id,
       name:      user.name,
       email:     user.email,
       createdAt: user.created_at,
       stats: {
-        reportCount: 0,
-        avgScore:    0,
-        highRisk:    0,
-        trusted:     0,
+        reportCount: total,
+        avgScore:    total ? Math.round(list.reduce((s, r) => s + (r.truth_score || 0), 0) / total) : 0,
+        highRisk:    list.filter(r => (r.truth_score || 0) < 40).length,
+        trusted:     list.filter(r => (r.truth_score || 0) >= 70).length,
       },
-      recentReports: [],
+      recentReports: list.slice(0, 5).map(r => ({
+        id: r.id, videoUrl: r.url, truthScore: r.truth_score, summary: r.summary, savedAt: r.created_at,
+      })),
     })
   } catch (err) {
     next(err)

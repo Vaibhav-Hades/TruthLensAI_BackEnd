@@ -12,9 +12,10 @@
 
 const { robustFetch } = require('../utils/apiClient');
 const cache = require('./cacheService');
+const { extractiveSummary } = require('./extractiveSummary');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama-3.1-8b-instant';
+const GROQ_MODEL   = (process.env.GROQ_MODEL || 'openai/gpt-oss-20b');
 
 // Stopwords and weak entities for deterministic local fallback
 const STOPWORDS = new Set([
@@ -64,22 +65,21 @@ function cleanText(text) {
     .replace(/^\d{1,2}:\d{2}(?:\s*-\s*\d{1,2}:\d{2})?\s+/gm, '')
     .replace(/^[A-Z][a-zA-Z0-9]+ \d+:/gm, '')
     .replace(/^[A-Z0-9\s_]{3,15}:/gm, '')
-    .replace(/\[[^\]]+\]/g, '')
-    .replace(/\([^)]+\)/g, '');
+    // Only strip non-speech tags like [Music] / (applause); keep factual parentheticals such as (25 bps).
+    .replace(/[\[(]\s*(music|applause|laughter|laughs|cheering|inaudible|crosstalk|silence|noise|sound|background[^\])]*)\s*[\])]/gi, '')
+    .replace(/\[[^\]]{0,40}\]/g, '');
 
   // 3. Multilingual Filler Noise & Verbal Tics Reduction (English, Hindi, Telugu, Tamil)
+  // Only true verbal tics. Words like "like", "well", "yes", "actually" can carry meaning ("well water",
+  // "yes vote") so they are no longer deleted blindly.
   const fillers = [
-    // English
-    'um', 'uh', 'ah', 'err', 'mmm', 'hmm', 'uh-huh', 'basically', 'actually', 
-    'literally', 'you know', 'sort of', 'kind of', 'anyway', 'so then', 'like', 'alright',
-    'you see', 'I mean', 'to be honest', 'frankly', 'well', 'okay', 'yeah', 'yes',
+    'um', 'uh', 'ah', 'err', 'mmm', 'hmm', 'uh-huh', 'you know', 'I mean', 'sort of', 'kind of',
     // Hindi/Hinglish
-    'matlab', 'yaani', 'achha', 'varna', 'theek hai', 'dekhiye', 'suniye', 'samajhiye',
-    'bilkul', 'shayad', 'kahin na kahin', 'ek tarah se', 'aap samajh rahe hain',
+    'matlab', 'yaani', 'theek hai', 'dekhiye', 'suniye', 'samajhiye', 'aap samajh rahe hain',
     // Telugu
-    'ante', 'mari', 'ippudu', 'entante', 'vachhi', 'asalu', 'ade',
+    'ante', 'entante',
     // Tamil
-    'appadi', 'vandhu', 'enna', 'theriyuma', 'irukku', 'saringa'
+    'appadi', 'theriyuma'
   ];
   
   const fillerRegex = new RegExp(`\\b(${fillers.join('|')})\\b`, 'gi');
@@ -232,21 +232,23 @@ function generateFallbackSummary(cleanedText, metadata = {}) {
     .map(s => s.trim())
     .filter(s => s.length > 30);
   
-  const coreStatement = sentences.slice(0, 2).join(' ') || cleanedText.slice(0, 250).trim();
-  const cleanSummary = `This video discusses issues surrounding ${topicsString}. The speaker communicates this through a narrative focused on ${sortedKeywords.slice(0, 3).join(', ') || 'key semantic indicators'}.`;
-  
+  const extracted = extractiveSummary(cleanedText, { maxSentences: 3, maxKeyPoints: 4 });
+  const cleanSummary = extracted.summary || cleanedText.slice(0, 280).trim();
+  const keyPoints = extracted.keyPoints;
+
   // Handle weak transcript confidence in local fallback
   let uncertaintyClause = '';
   let finalConfidence = confidenceScore;
   if (confidenceScore < 70 || audio === 'low' || cleanedText.length < 200) {
-    uncertaintyClause = ' Due to limited audio fidelity or transcription clarity in the source file, certain narrative assertions carry minor ambiguity and require direct reference audit.';
+    uncertaintyClause = ' The source text was short or of low quality, so some details may be incomplete.';
     finalConfidence = Math.max(30, confidenceScore - 15);
   }
 
-  const contextualNarrative = `The broadcast features a narrative with a predominantly ${tone} posture, primarily highlighting ${topicsString}.${uncertaintyClause} Investigative analysis has indexed these topics as primary search keys.`;
+  const contextualNarrative = `The content is mainly about ${topicsString}. Its tone is ${tone}.${uncertaintyClause}`.trim();
 
   return {
     cleanSummary,
+    keyPoints,
     summaryConfidence: finalConfidence,
     contextualNarrative,
     keyTopics: mainTopics.length > 0 ? mainTopics : ['General Analysis', 'Media Review']
@@ -304,13 +306,14 @@ async function generateCleanSummary(rawTranscript, metadata = {}) {
     'ANALYSIS INSTRUCTIONS:',
     '1. NARRATIVE UNDERSTANDING (Step 3): Comprehend what the speaker is discussing, the political/social context, major events, factual statements, narrative relationships, and controversial discussions.',
     '2. IMPORTANT CONTENT PRIORITIZATION (Step 4): Prioritize factual discussions, major events, political topics, controversial claims, and narrative-driving details. Downplay or ignore greetings, conversational filler, stutters, and low-information talk.',
-    '3. HUMANIZED SUMMARY (Step 5): Generate ONLY ONE clean, concise, human-written newsroom summary (2-3 sentences max). Ensure it sounds highly professional, authoritative, fluid, and natural. DO NOT use robotic phrasing, forensic/debug jargon (like "transcript", "confidence scores", "fallback", "semantic analysis"), or generic AI openings like "In this video...", "This transcript talks about...".',
+    '3. SUMMARY: Write a faithful, neutral summary of 3-4 sentences in plain journalistic prose. Lead with the single most important fact. Name the people, organisations, places, dates and figures exactly as the source gives them. Attribute assertions to their source ("the speaker says...", "the article reports...") instead of stating them as established fact. Do NOT judge truthfulness, add outside knowledge, speculate, or use hype/evaluative words. Do NOT start with "In this video", "This content", or "The transcript". Write in the same language as the source text.',
     '4. ENTITY & CONTEXT PRESERVATION (Step 6): Accurately preserve people, locations, organizations, political parties, events, technologies, and relationships between them.',
     isWeakText ? '5. LOW-QUALITY TEXT HANDLING (Step 7): WARNING: The extracted transcript is of low quality or contains high conversational noise. Naturally preserve this uncertainty in your writing. Acknowledge what parts are unclear, do not invent details, and avoid hallucinating certainty.' : '',
     '',
     'RETURN ONLY A JSON OBJECT (NO MARKDOWN WRAPPERS, NO BACKTICKS):',
     '{',
-    '  "cleanSummary": "A highly accurate, human-readable, fluid executive summary (2-3 sentences) capturing the core discussion and what happened.",',
+    '  "cleanSummary": "Faithful, neutral 3-4 sentence summary with concrete names, numbers and dates, with claims attributed to their source.",',
+    '  "keyPoints": ["3-4 short bullet facts or assertions from the source, each under 25 words, no opinions of your own"],',
     '  "summaryConfidence": 0-100 (a realistic confidence percentage based on factual density, source clarity, and overall completeness),',
     '  "contextualNarrative": "A professional analysis (3-4 sentences) outlining the underlying political/social context, speaker intent, controversy level, and the relationships between primary entities.",',
     '  "keyTopics": ["Up to 4 specific newsroom-grade narrative/event topics or categories"]',
@@ -330,7 +333,7 @@ async function generateCleanSummary(rawTranscript, metadata = {}) {
         model: GROQ_MODEL,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.15, // Low temperature for high deterministic accuracy and factual consistency
-        max_tokens: 800,
+        max_tokens: 1000,
         response_format: { type: "json_object" }
       },
       headers: {
@@ -349,7 +352,8 @@ async function generateCleanSummary(rawTranscript, metadata = {}) {
     }
 
     const finalResult = {
-      cleanSummary: String(parsed.cleanSummary).trim().slice(0, 600),
+      cleanSummary: String(parsed.cleanSummary).trim().slice(0, 900),
+      keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 4).map(k => String(k).trim().slice(0, 200)).filter(Boolean) : [],
       summaryConfidence: Math.max(10, Math.min(100, Number(parsed.summaryConfidence || 85))),
       contextualNarrative: String(parsed.contextualNarrative || '').trim().slice(0, 800),
       keyTopics: Array.isArray(parsed.keyTopics) ? parsed.keyTopics.slice(0, 5).map(t => String(t).trim()) : ['General News']

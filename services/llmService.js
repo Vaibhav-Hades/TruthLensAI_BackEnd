@@ -93,7 +93,7 @@ const localFallback = function(transcript) {
 // ── Groq LLM (primary) ────────────────────────────────────────────────────────
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL   = 'llama-3.1-8b-instant'
+const GROQ_MODEL   = (process.env.GROQ_MODEL || 'openai/gpt-oss-20b')
 
 const summarizeWithGroq = async function(transcript) {
   const cacheKey = cache.generateKey('summary_v3', transcript);
@@ -309,7 +309,7 @@ const chatWithGroq = async function({ question, context, history, language, sarv
 
   // Construct a dense forensic context for the LLM
   const forensicCtx = {
-    verdict: context.verdict_label || context.verdict || 'Unverified',
+    verdict: context.prediction || context.verdict_label || context.verdict || 'Unverified',
     score: context.truthScore || context.credibilityScore || 0,
     summary: context.summary || '',
     claims: (context.claims || []).map(c => `[${c.category}] ${c.claim}`),

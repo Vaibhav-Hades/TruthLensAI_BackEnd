@@ -12,7 +12,7 @@ const FormData = require('form-data')
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const GROQ_WHISPER_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
-const WHISPER_MODEL    = 'whisper-large-v3'
+const WHISPER_MODEL    = process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3'
 const MAX_DURATION_SEC = 1800                  // Increased to 30 minutes
 const MAX_FILE_BYTES   = 24 * 1024 * 1024      // 24MB (safe margin for Groq 25MB)
 const FFMPEG_BITRATE   = '32k'                 // Slightly higher for better fidelity
@@ -65,6 +65,10 @@ async function downloadRawAudio(videoUrl, playerClient) {
   // the most aggressive YouTube bot checks. Never required for basic use.
   if (process.env.YTDLP_COOKIES) {
     args.push('--cookies', process.env.YTDLP_COOKIES)
+  }
+  // Newer yt-dlp needs a JavaScript runtime for YouTube (e.g. YTDLP_JS_RUNTIME=node). Optional.
+  if (process.env.YTDLP_JS_RUNTIME) {
+    args.push('--js-runtimes', process.env.YTDLP_JS_RUNTIME)
   }
 
   return new Promise((resolve, reject) => {
@@ -146,7 +150,9 @@ async function processAudioWithFfmpeg(rawPath) {
     ]
 
     const proc = spawn(FFMPEG_BIN, args)
-    proc.on('error', reject)
+    proc.on('error', err => reject(Object.assign(new Error('FFmpeg is not available on this machine. Install it and ensure it is on PATH (or set FFMPEG_PATH).'), {
+      errorCode: 'FFMPEG_MISSING', status: 500, cause: err
+    })))
     let stderr = ''
     proc.stderr.on('data', d => { stderr += d.toString() })
     proc.on('close', code => {
@@ -169,6 +175,9 @@ function estimateAudioQuality(confidence) {
 // ── Step 3: Multilingual Whisper ──────────────────────────────────────────────
 async function transcribeWithWhisper(audioPath) {
   const key = process.env.GROQ_API_KEY
+  if (!key) {
+    throw Object.assign(new Error('Whisper transcription is not configured (GROQ_API_KEY is not set).'), { errorCode: 'WHISPER_NOT_CONFIGURED', status: 503 })
+  }
   const form = new FormData()
   form.append('file', fs.createReadStream(audioPath))
   form.append('model', WHISPER_MODEL)

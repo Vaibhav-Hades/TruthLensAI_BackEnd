@@ -1,168 +1,126 @@
 // translateController.js
-// Translates a structured analysis payload to the target language via Groq.
-// Handles all dynamic AI-generated fields including narrative intelligence,
-// article titles/summaries, deepfake/visual reasoning, and verdict labels.
+// POST /api/translate  { payload: { key: string | (string|null)[] , ... }, targetLang: 'hi'|'te'|'ta'|'en' }
+// -> { translated: <same shape, strings translated> }
 //
-// Large payloads are split into two Groq calls (core + narrative) to stay
-// within the token limit and avoid truncated translations.
+// Generic by design: every string in the payload is translated, so new result fields never
+// silently stay in English. Strings are flattened, translated in parallel batches with an
+// index-addressed JSON contract (so order/length can be verified), and any string that fails
+// falls back to its original text.
 
 const axios = require('axios')
+const cache = require('../services/cacheService')
+const { GROQ_API_URL, GROQ_MODEL } = require('../config/llm')
 
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL   = 'llama-3.1-8b-instant'
+const LANG_NAMES = { hi: 'Hindi (Devanagari script)', te: 'Telugu (Telugu script)', ta: 'Tamil (Tamil script)', en: 'English' }
 
-const LANG_NAMES = { hi: 'Hindi', te: 'Telugu', ta: 'Tamil', en: 'English' }
+const MAX_STRINGS = 300
+const MAX_CHARS_PER_STRING = 1500
+const BATCH_CHARS = 5000
+const BATCH_ITEMS = 25
 
-// ── Groq call helper ──────────────────────────────────────────────────────────
-async function groqTranslate(toTranslate, langName, key) {
-  if (!Object.keys(toTranslate).length) return {}
+function flatten(payload) {
+  const items = [] // { key, index|null, text }
+  for (const [key, val] of Object.entries(payload)) {
+    if (typeof val === 'string' && val.trim()) items.push({ key, index: null, text: val.slice(0, MAX_CHARS_PER_STRING) })
+    else if (Array.isArray(val)) val.forEach((v, i) => { if (typeof v === 'string' && v.trim()) items.push({ key, index: i, text: v.slice(0, MAX_CHARS_PER_STRING) }) })
+  }
+  return items
+}
 
+function toBatches(items) {
+  const batches = []
+  let cur = [], chars = 0
+  for (const it of items) {
+    if (cur.length && (cur.length >= BATCH_ITEMS || chars + it.text.length > BATCH_CHARS)) { batches.push(cur); cur = []; chars = 0 }
+    cur.push(it); chars += it.text.length
+  }
+  if (cur.length) batches.push(cur)
+  return batches
+}
+
+async function translateBatch(batch, langName, key) {
+  const input = {}
+  batch.forEach((it, i) => { input[String(i)] = it.text })
   const prompt = [
-    `You are a professional translator. Translate the following JSON fields to ${langName}.`,
+    `Translate every value of the JSON object below into ${langName}.`,
     'Rules:',
-    '- Return ONLY valid JSON with the exact same keys and array lengths.',
-    '- Preserve array length exactly — translate each element, keep nulls as null.',
-    '- Do NOT translate proper nouns, URLs, numbers, organisation names, or source names.',
-    '- Preserve the original meaning, tone, and factual accuracy.',
-    '- No explanations, no markdown, no extra text outside the JSON.',
+    '- Return ONLY a JSON object with exactly the same keys ("0", "1", ...). Each value is the translation of the matching input value.',
+    '- Keep proper nouns, organisation and publication names, numbers, dates, URLs and #hashtags unchanged (people and place names may be transliterated into the target script).',
+    '- Preserve meaning, tone and factual precision. Do not add, omit or explain anything.',
+    '- Use natural, fluent, standard written language, not a word-by-word translation.',
     '',
-    'Input JSON:',
-    JSON.stringify(toTranslate),
+    JSON.stringify(input),
   ].join('\n')
 
   const response = await axios.post(
     GROQ_API_URL,
-    { model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 2400 },
-    { headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' }, timeout: 20000 }
+    { model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 3500, response_format: { type: 'json_object' } },
+    { headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, timeout: 30000 }
   )
-
-  const raw     = response.data.choices[0].message.content.trim()
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
-  return JSON.parse(cleaned)
+  const raw = response.data.choices[0].message.content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+  const parsed = JSON.parse(raw)
+  return batch.map((it, i) => (typeof parsed[String(i)] === 'string' && parsed[String(i)].trim() ? parsed[String(i)] : it.text))
 }
 
-// ── Merge translated chunk back, preserving nulls for skipped fields ──────────
-function mergeArrayField(payload, translated, key) {
-  return (payload[key] || []).map((orig, i) =>
-    orig === null ? null : (translated[key]?.[i] || orig)
-  )
-}
-
-// ── Build fallback (original values) ─────────────────────────────────────────
-function buildFallback(payload) {
-  const ARRAY_KEYS = [
-    'reasoning_points','claims','claim_reasonings','sources',
-    'article_titles','article_summaries','article_match_reasons',
-    'supporting_titles','supporting_summaries','supporting_match_reasons',
-    'contradicting_titles','contradicting_summaries','contradicting_match_reasons',
-  ]
-  const result = {}
-  for (const k of ARRAY_KEYS) result[k] = (payload[k] || []).map(v => v)
-  const SCALAR_KEYS = [
-    'summary','meaning','explanation','verdict_label','fetch_diagnostic',
-    'narrative_reasoning','consensus_summary','visual_reasoning','deepfake_reasoning','chat_response',
-  ]
-  for (const k of SCALAR_KEYS) result[k] = payload[k] || null
-  return result
-}
-
-// ── POST /api/translate ───────────────────────────────────────────────────────
-const translate = async function(req, res, next) {
-  try {
-    const { payload, targetLang } = req.body
-
-    if (!payload || typeof payload !== 'object') {
-      return res.status(400).json({ error: 'payload object is required.' })
+async function translateBatchWithRetry(batch, langName, key) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return await translateBatch(batch, langName, key) } catch (e) {
+      if (attempt === 1) {
+        console.warn('[translate] batch failed, using original text:', e.message)
+        return batch.map(it => it.text)
+      }
     }
-    if (!targetLang || targetLang === 'en') {
-      return res.status(200).json({ translated: buildFallback(payload) })
-    }
-
-    const langName = LANG_NAMES[targetLang]
-    if (!langName) return res.status(400).json({ error: 'Unsupported target language.' })
-
-    const key = process.env.GROQ_API_KEY
-    if (!key || key === 'your_groq_api_key_here') {
-      return res.status(200).json({ translated: buildFallback(payload) })
-    }
-
-    // ── Chunk 1: Core analysis fields ─────────────────────────────────────────
-    const coreChunk = {}
-    const CORE_SCALARS = ['summary','meaning','explanation','verdict_label','fetch_diagnostic','consensus_summary','visual_reasoning','deepfake_reasoning','chat_response']
-    for (const k of CORE_SCALARS) { if (payload[k]) coreChunk[k] = String(payload[k]).slice(0, 2000) }
-
-    const coreArrays = ['reasoning_points','claims','claim_reasonings','sources']
-    for (const k of coreArrays) {
-      const arr = (payload[k] || []).filter(Boolean)
-      if (arr.length) coreChunk[k] = arr.map(v => String(v).slice(0, 300))
-    }
-
-    // ── Chunk 2: Narrative intelligence fields ────────────────────────────────
-    const narrativeChunk = {}
-    if (payload.narrative_reasoning) narrativeChunk.narrative_reasoning = String(payload.narrative_reasoning).slice(0, 500)
-
-    const narrativeArrays = [
-      'article_titles','article_summaries','article_match_reasons',
-      'supporting_titles','supporting_summaries','supporting_match_reasons',
-      'contradicting_titles','contradicting_summaries','contradicting_match_reasons',
-    ]
-    for (const k of narrativeArrays) {
-      const arr = (payload[k] || []).filter(Boolean)
-      if (arr.length) narrativeChunk[k] = arr.map(v => String(v).slice(0, 300))
-    }
-
-    // Nothing to translate
-    if (!Object.keys(coreChunk).length && !Object.keys(narrativeChunk).length) {
-      return res.status(200).json({ translated: buildFallback(payload) })
-    }
-
-    // Run both chunks in parallel
-    const [coreT, narrativeT] = await Promise.all([
-      Object.keys(coreChunk).length      ? groqTranslate(coreChunk,      langName, key) : Promise.resolve({}),
-      Object.keys(narrativeChunk).length ? groqTranslate(narrativeChunk, langName, key) : Promise.resolve({}),
-    ])
-
-    // ── Merge results ─────────────────────────────────────────────────────────
-    const translated = {
-      // Core scalars
-      summary:            coreT.summary            || payload.summary            || null,
-      meaning:            coreT.meaning            || payload.meaning            || null,
-      explanation:        coreT.explanation        || payload.explanation        || null,
-      verdict_label:      coreT.verdict_label      || payload.verdict_label      || null,
-      fetch_diagnostic:   coreT.fetch_diagnostic   || payload.fetch_diagnostic   || null,
-      consensus_summary:  coreT.consensus_summary  || payload.consensus_summary  || null,
-      visual_reasoning:   coreT.visual_reasoning   || payload.visual_reasoning   || null,
-      deepfake_reasoning: coreT.deepfake_reasoning || payload.deepfake_reasoning || null,
-      chat_response:      coreT.chat_response      || payload.chat_response      || null,
-
-      // Core arrays
-      reasoning_points: mergeArrayField(payload, coreT, 'reasoning_points'),
-      claims:           mergeArrayField(payload, coreT, 'claims'),
-      claim_reasonings: mergeArrayField(payload, coreT, 'claim_reasonings'),
-      sources:          mergeArrayField(payload, coreT, 'sources'),
-
-      // Narrative scalar
-      narrative_reasoning: narrativeT.narrative_reasoning || payload.narrative_reasoning || null,
-
-      // Narrative arrays
-      article_titles:              mergeArrayField(payload, narrativeT, 'article_titles'),
-      article_summaries:           mergeArrayField(payload, narrativeT, 'article_summaries'),
-      article_match_reasons:       mergeArrayField(payload, narrativeT, 'article_match_reasons'),
-      supporting_titles:           mergeArrayField(payload, narrativeT, 'supporting_titles'),
-      supporting_summaries:        mergeArrayField(payload, narrativeT, 'supporting_summaries'),
-      supporting_match_reasons:    mergeArrayField(payload, narrativeT, 'supporting_match_reasons'),
-      contradicting_titles:        mergeArrayField(payload, narrativeT, 'contradicting_titles'),
-      contradicting_summaries:     mergeArrayField(payload, narrativeT, 'contradicting_summaries'),
-      contradicting_match_reasons: mergeArrayField(payload, narrativeT, 'contradicting_match_reasons'),
-    }
-
-    return res.status(200).json({ translated })
-
-  } catch (err) {
-    console.warn('[translate] Groq call failed, returning original:', err.message)
-    const fallback = req.body?.payload ? buildFallback(req.body.payload) : null
-    return res.status(200).json({ translated: fallback })
   }
 }
 
-module.exports = { translate }
+const translate = async function(req, res, next) {
+  try {
+    const { payload, targetLang } = req.body || {}
+
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ error: 'payload object is required.', errorCode: 'INVALID_INPUT' })
+    }
+    if (targetLang && !LANG_NAMES[targetLang]) {
+      return res.status(400).json({ error: 'Unsupported target language.', errorCode: 'UNSUPPORTED_LANGUAGE' })
+    }
+    if (!targetLang || targetLang === 'en') return res.status(200).json({ translated: payload })
+
+    const key = process.env.GROQ_API_KEY
+    if (!key || key === 'your_groq_api_key_here') return res.status(200).json({ translated: payload, degraded: 'no_api_key' })
+
+    const items = flatten(payload)
+    if (items.length > MAX_STRINGS) return res.status(413).json({ error: 'Too many strings to translate.', errorCode: 'PAYLOAD_TOO_LARGE' })
+
+    // Per-string cache so repeated phrases (verdicts, source names) and re-opened results are instant.
+    const out = items.map(it => cache.get(cache.generateKey('tx_v1', targetLang + '|' + it.text)))
+    const todo = items.map((it, i) => ({ it, i })).filter(x => out[x.i] == null)
+
+    const batches = toBatches(todo.map(x => x.it))
+    let cursor = 0
+    const results = await Promise.all(batches.map(async (b) => {
+      const start = cursor; cursor += b.length
+      return { start, texts: await translateBatchWithRetry(b, LANG_NAMES[targetLang], key) }
+    }))
+    for (const { start, texts } of results) {
+      texts.forEach((txt, j) => {
+        const { it, i } = todo[start + j]
+        out[i] = txt
+        if (txt !== it.text) cache.set(cache.generateKey('tx_v1', targetLang + '|' + it.text), txt, 1000 * 60 * 60 * 24 * 7)
+      })
+    }
+
+    // Rebuild the same shape as the input.
+    const translated = {}
+    for (const [k, v] of Object.entries(payload)) translated[k] = Array.isArray(v) ? [...v] : v
+    items.forEach((it, i) => {
+      if (it.index === null) translated[it.key] = out[i]
+      else translated[it.key][it.index] = out[i]
+    })
+    return res.status(200).json({ translated })
+  } catch (err) {
+    console.warn('[translate] failed, returning original:', err.message)
+    return res.status(200).json({ translated: req.body?.payload || null, degraded: 'error' })
+  }
+}
+
+module.exports = { translate, flatten }

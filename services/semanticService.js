@@ -9,7 +9,7 @@ const { robustFetch } = require('../utils/apiClient');
 const logger = require('../utils/pipelineLogger');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama-3.1-8b-instant';
+const GROQ_MODEL   = (process.env.GROQ_MODEL || 'openai/gpt-oss-20b');
 
 /**
  * Main Entry Point for Phase 4: Streamlined Semantic Audit
@@ -29,11 +29,10 @@ async function runSemanticVerification(claims, evidenceArticles, originalSummary
     const unverified = claimVerifications.filter(c => c.verdict === 'UNVERIFIED').length;
     const total = claimVerifications.length;
     
-    // Calculate alignment based on claim verdicts
-    const alignment = total > 0 
-      ? Math.round((supported / total) * 100) 
-      : (evidenceArticles && evidenceArticles.length > 0 ? 40 : 10);
-    
+    // Alignment only reflects claims that could actually be decided; unverified claims are neutral (not "false").
+    const decided = supported + refuted
+    const alignment = decided > 0 ? Math.round((supported / decided) * 100) : 50
+
     // Determine contradiction level
     let contradictionLevel = 'none';
     if (refuted > supported) contradictionLevel = 'high';
@@ -60,11 +59,11 @@ async function runSemanticVerification(claims, evidenceArticles, originalSummary
       narrativeAlignment: alignment,
       contradictionLevel,
       consensusState,
-      semanticConfidence: Math.min(100, Math.max(20, alignment + 10)),
+      semanticConfidence: decided > 0 ? Math.min(100, 40 + decided * 15) : 20,
       narrativeReasoning: reasoningParts.join('. ') + '.',
       claimVerifications, // Pass through the per-claim results
-      supportingSources: evidenceArticles.filter(a => a.stance === 'support'),
-      contradictingSources: evidenceArticles.filter(a => a.stance === 'refute'),
+      supportingSources: (evidenceArticles || []).filter(a => a.stance === 'support'),
+      contradictingSources: (evidenceArticles || []).filter(a => a.stance === 'refute'),
       metadata: { 
         processingTimeMs: durationMs,
         claimsVerified: total,

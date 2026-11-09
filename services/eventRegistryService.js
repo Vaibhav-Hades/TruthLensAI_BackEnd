@@ -1,75 +1,85 @@
 /**
  * eventRegistryService.js
- * 
- * PHASE 3 V3: Streamlined Precision Retrieval & Evidence Synthesis
- * Optimized for fast article retrieval and clean journalistic evidence ranking.
+ *
+ * PHASE 3: Live evidence retrieval from Event Registry + per-claim stance checking.
+ *
+ * Required env: ER_API_KEY (Event Registry), GROQ_API_KEY (stance checking).
+ * Without ER_API_KEY retrieval is skipped and reported via `retrievalStatus`
+ * (the pipeline then returns INCONCLUSIVE instead of guessing).
+ *
+ * A claim is only marked SUPPORTED/REFUTED when the model cites at least one of the
+ * supplied articles. Anything else is UNVERIFIED. Topic similarity is never treated as support.
  */
 
 const { robustFetch } = require('../utils/apiClient');
 const logger = require('../utils/pipelineLogger');
+const { GROQ_API_URL, GROQ_MODEL } = require('../config/llm');
 
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama-3.1-8b-instant';
+const ER_URL = 'https://eventregistry.org/api/v1/article/getArticles';
 
 const PREMIUM_SOURCES = new Set([
-  'reuters.com', 'apnews.com', 'bbc.com', 'bbc.co.uk', 'aljazeera.com', 
+  'reuters.com', 'apnews.com', 'bbc.com', 'bbc.co.uk', 'aljazeera.com',
   'bloomberg.com', 'wsj.com', 'nytimes.com', 'theguardian.com',
   'aninews.in', 'timesofindia.indiatimes.com', 'economictimes.indiatimes.com',
-  'thehindu.com', 'indianexpress.com', 'hindustantimes.com', 'indiatoday.in', 
+  'thehindu.com', 'indianexpress.com', 'hindustantimes.com', 'indiatoday.in',
   'ndtv.com', 'news18.com', 'pib.gov.in',
   'factcheck.org', 'politifact.com', 'snopes.com', 'altnews.in', 'boomlive.in'
 ]);
 
+const STOPWORDS = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','is','it','its','this','that','was','are','be','been','have','has','had','he','she','they','we','you','i','my','his','her','their','our','your','so','as','if','by','from','up','about','into','than','then','when','there','here','what','which','who','how','all','just','also','more','not','no','do','did','does','will','would','could','should','can','may']);
+
+function getErKey() { return process.env.ER_API_KEY || '' }
+
+function isPremium(domain) {
+  const d = String(domain || '').toLowerCase().replace(/^www\./, '');
+  return PREMIUM_SOURCES.has(d) || [...PREMIUM_SOURCES].some(p => d.endsWith('.' + p));
+}
+
 async function analyzeLiveNarrative(pipelineInput, intelligence) {
   const startTime = Date.now();
-  console.log('[retrieval:v3] 🔍 Initiating Streamlined Retrieval...');
+
+  if (!getErKey()) {
+    console.warn('[retrieval] ER_API_KEY is not set - live evidence retrieval skipped.');
+    return getEmptyEvidenceResult('er_key_missing', claimsOf(intelligence));
+  }
 
   try {
-    // NEW: Per-claim search and comparison
-    const claims = intelligence.extractedClaims || intelligence.claims || [];
-    const claimVerifications = [];
-    let allRawArticles = [];
+    const claims = claimsOf(intelligence);
+    const erState = { errors: [], calls: 0 };
 
-    // Search for articles for each claim
-    for (const claim of claims.slice(0, 5)) { // Limit to top 5 claims
-      const searchQuery = claim.searchQuery || claim.claim;
-      const erQuery = buildClaimQuery(claim, intelligence);
-      const rawArticles = await fetchArticlesFromER(erQuery);
-      
-      if (rawArticles.length > 0) {
-        // Compare this claim against found articles
-        const verification = await verifyClaimAgainstArticles(claim, rawArticles, intelligence);
-        claimVerifications.push(verification);
-        allRawArticles.push(...rawArticles);
-      } else {
-        claimVerifications.push({
-          claim: claim.claim,
-          verdict: 'Unverified',
-          confidence: 0,
-          evidence: [],
-          reasoning: 'No relevant articles found to verify this claim.'
-        });
+    // Claims are checked in parallel (sequential calls blew the request time budget).
+    const perClaim = await Promise.all(claims.map(async (claim) => {
+      const articles = await searchForClaim(claim, intelligence, erState);
+      if (!articles.length) {
+        return { articles: [], verification: unverified(claim, 'No relevant news articles were found for this claim.') };
       }
+      const verification = await verifyClaimAgainstArticles(claim, articles);
+      return { articles, verification };
+    }));
+
+    const claimVerifications = perClaim.map(p => p.verification);
+    let allRawArticles = perClaim.flatMap(p => p.articles);
+
+    // General topical search for context panels.
+    const generalQuery = buildSimpleQuery(intelligence);
+    if (generalQuery.keyword.length) {
+      allRawArticles.push(...await fetchArticlesFromER(generalQuery, erState));
     }
 
-    // Also do a general search for overall context
-    const { searchQuery, erQuery } = buildSimpleQuery(intelligence);
-    const generalArticles = await fetchArticlesFromER(erQuery);
-    allRawArticles.push(...generalArticles);
-
-    // Deduplicate articles
     const uniqueArticles = deduplicateArticles(allRawArticles);
-    
+    const retrievalStatus = erState.errors.length && erState.errors.length >= erState.calls
+      ? `er_error:${erState.errors[0]}`
+      : 'ok';
+
     if (uniqueArticles.length === 0) {
-      return getEmptyEvidenceResult('No institutional evidence found for these identifiers.');
+      return { ...getEmptyEvidenceResult(retrievalStatus === 'ok' ? 'no_articles' : retrievalStatus, claims), claimVerifications };
     }
 
-    // Process evidence for overall context
-    const evidence = await processEvidence(uniqueArticles, intelligence);
+    const evidence = await processEvidence(uniqueArticles, intelligence, claimVerifications);
     const durationMs = Date.now() - startTime;
 
     logger.logRetrieval({
-      queryUsed: searchQuery,
+      queryUsed: generalQuery.keyword.join(' '),
       articlesFound: uniqueArticles.length,
       claimsVerified: claimVerifications.length,
       durationMs
@@ -77,233 +87,215 @@ async function analyzeLiveNarrative(pipelineInput, intelligence) {
 
     return {
       ...evidence,
-      claimVerifications, // NEW: Per-claim verification results
-      metadata: { 
-        searchQueryUsed: searchQuery, 
+      claimVerifications,
+      retrievalStatus,
+      metadata: {
+        searchQueryUsed: generalQuery.keyword.join(' '),
         processingTimeMs: durationMs,
-        claimsProcessed: claimVerifications.length
+        claimsProcessed: claimVerifications.length,
+        erCalls: erState.calls,
+        erErrors: erState.errors.length
       }
     };
   } catch (error) {
     logger.emit('ERROR', 'retrieval', 'Retrieval Failure', { error: error.message });
-    return getEmptyEvidenceResult('Internal retrieval failure.');
+    return getEmptyEvidenceResult(`retrieval_failure:${error.message}`, claimsOf(intelligence));
   }
 }
 
-/**
- * Build a search query for a specific claim
- */
-function buildClaimQuery(claim, intelligence) {
-  // Use claim's searchQuery if provided, otherwise build from claim text
-  const claimText = claim.claim || '';
-  const entities = claim.entities || [];
-  
-  // Extract key terms from the claim
-  const searchTerms = [
-    ...entities.slice(0, 2),
-    ...(claim.searchQuery ? [claim.searchQuery] : [])
-  ].filter(t => t && t.length > 2);
-
-  // If no specific terms, use a simplified version of the claim
-  if (searchTerms.length === 0) {
-    const words = claimText.split(/\s+/).filter(w => w.length > 4 && !STOPWORDS.has(w.toLowerCase()));
-    searchTerms.push(...words.slice(0, 3));
-  }
-
+function unverified(claim, reasoning) {
   return {
-    action: "getArticles",
-    keyword: searchTerms.length > 0 ? searchTerms : [claimText.slice(0, 50)],
-    keywordOper: "or",
-    lang: ["eng"],
-    articlesPage: 1,
-    articlesCount: 10,
-    articlesSortBy: "rel",
-    resultType: "articles",
-    apiKey: process.env.ER_API_KEY || '264ad997-d429-4a6d-825b-54e7c57a101b'
+    claim: claim.claim,
+    verdict: 'UNVERIFIED',
+    confidence: 0,
+    evidence: [],
+    reasoning,
+    category: claim.category || 'General'
   };
 }
 
-/**
- * Verify a specific claim against found articles
- */
-async function verifyClaimAgainstArticles(claim, articles, intelligence) {
-  const groqKey = process.env.GROQ_API_KEY;
-  
-  // Prepare article context for the claim
-  const articleContext = articles.slice(0, 4).map((art, i) => {
-    return `[Article ${i+1}: ${art.source}] ${art.title}: ${(art.body || '').slice(0, 400)}`;
-  }).join('\n\n');
-
-  const prompt = `
-    You are a fact-checker verifying a specific claim against news articles.
-    
-    CLAIM TO VERIFY: "${claim.claim}"
-    CLAIM CONTEXT: ${claim.context || 'No additional context'}
-    
-    NEWS ARTICLES FOUND:
-    ${articleContext}
-    
-    TASK: Determine if the claim is SUPPORTED, REFUTED, or UNVERIFIED by these articles.
-    
-    ANALYSIS:
-    1. Does any article directly confirm this claim? (SUPPORTED)
-    2. Does any article directly contradict this claim? (REFUTED)
-    3. Are the articles about the topic but don't address this specific claim? (UNVERIFIED)
-    
-    RETURN JSON:
-    {
-      "verdict": "SUPPORTED|REFUTED|UNVERIFIED",
-      "confidence": 0-100,
-      "evidence": ["Article title or snippet that supports/refutes"],
-      "reasoning": "Brief explanation of why this verdict was reached"
-    }
-  `;
-
-  try {
-    const data = await robustFetch({
-      method: 'post',
-      url: GROQ_API_URL,
-      data: { 
-        model: GROQ_MODEL, 
-        messages: [{ role: 'user', content: prompt }], 
-        temperature: 0.1, 
-        response_format: { type: "json_object" } 
-      },
-      headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
-    }, { stage: 'claim-verification' });
-
-    const parsed = JSON.parse(data.choices[0].message.content);
-    
-    return {
-      claim: claim.claim,
-      verdict: parsed.verdict || 'UNVERIFIED',
-      confidence: Math.min(100, Math.max(0, Number(parsed.confidence) || 50)),
-      evidence: parsed.evidence || [],
-      reasoning: parsed.reasoning || 'Analysis complete.',
-      category: claim.category || 'General'
-    };
-  } catch (e) {
-    return {
-      claim: claim.claim,
-      verdict: 'UNVERIFIED',
-      confidence: 0,
-      evidence: [],
-      reasoning: 'Verification failed due to processing error.',
-      category: claim.category || 'General'
-    };
+/** Search with a strict (AND) query first; fall back to a looser (OR) query if it finds nothing. */
+async function searchForClaim(claim, intelligence, erState) {
+  const terms = claimSearchTerms(claim);
+  if (!terms.length) return [];
+  let articles = await fetchArticlesFromER(erQuery(terms, 'and', 10), erState);
+  if (articles.length < 2 && terms.length > 1) {
+    articles = articles.concat(await fetchArticlesFromER(erQuery(terms, 'or', 10), erState));
   }
+  return deduplicateArticles(articles);
 }
 
-/**
- * Deduplicate articles by URL
- */
-function deduplicateArticles(articles) {
-  const seen = new Set();
-  return articles.filter(art => {
-    const key = art.url || art.title;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+function claimSearchTerms(claim) {
+  const fromEntities = (claim.entities || []).filter(e => typeof e === 'string' && e.length > 2).slice(0, 2);
+  const text = claim.searchQuery || claim.claim || '';
+  const words = text.split(/[^\p{L}\p{N}]+/u).filter(w => w.length > 3 && !STOPWORDS.has(w.toLowerCase()));
+  return [...new Set([...fromEntities, ...words])].slice(0, 4);
 }
 
-// Stopwords for query building
-const STOPWORDS = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','is','it','its','this','that','was','are','be','been','have','has','had','he','she','they','we','you','i','my','his','her','their','our','your','so','as','if','by','from','up','about','into','than','then','when','there','here','what','which','who','how','all','just','also','more','not','no','do','did','does','will','would','could','should','can','may']);
+function erQuery(keywords, oper, count) {
+  return {
+    action: 'getArticles',
+    keyword: keywords,
+    keywordOper: oper,
+    lang: ['eng'],
+    articlesPage: 1,
+    articlesCount: count,
+    articlesSortBy: 'rel',
+    resultType: 'articles',
+    apiKey: getErKey()
+  };
+}
 
 function buildSimpleQuery(intelligence) {
   const primary = intelligence.retrievalSignals?.retrievalQuery;
   const entities = (intelligence.extractedEntities || intelligence.entities || []).slice(0, 3);
   const keywords = (intelligence.extractedKeywords || intelligence.keywords || []).slice(0, 2);
-  
-  // Prioritize the extraction-driven retrieval query
-  const queryTerms = primary 
-    ? [primary] 
-    : [...new Set([...entities, ...keywords])].filter(t => t.length > 3);
-    
-  const searchQuery = queryTerms.join(' ');
-  const erQuery = {
-    action: "getArticles",
-    keyword: queryTerms,
-    keywordOper: primary ? "and" : "or",
-    lang: ["eng"],
-    articlesPage: 1,
-    articlesCount: 40,
-    articlesSortBy: "rel",
-    resultType: "articles",
-    apiKey: process.env.ER_API_KEY || '264ad997-d429-4a6d-825b-54e7c57a101b'
-  };
-
-  return { searchQuery, erQuery };
+  const terms = primary ? [primary] : [...new Set([...entities, ...keywords])].filter(t => typeof t === 'string' && t.length > 3);
+  return erQuery(terms, primary ? 'and' : 'or', 30);
 }
 
-async function fetchArticlesFromER(query) {
+/**
+ * Compares one claim with retrieved articles. The model must cite article numbers;
+ * a SUPPORTED/REFUTED verdict without citations is downgraded to UNVERIFIED.
+ */
+async function verifyClaimAgainstArticles(claim, articles) {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) return unverified(claim, 'Stance checking is unavailable (GROQ_API_KEY not set).');
+
+  const used = articles.slice(0, 5);
+  const articleContext = used.map((art, i) =>
+    `[Article ${i + 1}: ${art.source}] ${art.title}: ${(art.body || '').slice(0, 500)}`
+  ).join('\n\n');
+
+  const prompt = `
+You are a careful fact-checker. Decide whether the NEWS ARTICLES below confirm or contradict the CLAIM.
+
+CLAIM: "${claim.claim}"
+CLAIM CONTEXT: ${claim.context || 'none'}
+
+NEWS ARTICLES:
+${articleContext}
+
+RULES
+- SUPPORTED: at least one article states the same fact (same people, event, numbers).
+- REFUTED: at least one article states something that directly conflicts with the claim.
+- UNVERIFIED: the articles are only on the same topic, or do not address this specific claim.
+- Similar topic or shared keywords is NOT support. When in doubt choose UNVERIFIED.
+- Cite the article numbers you relied on in "articleNumbers".
+
+Return JSON only:
+{"verdict":"SUPPORTED|REFUTED|UNVERIFIED","confidence":0-100,"articleNumbers":[1],"evidence":["short quote or paraphrase"],"reasoning":"one or two sentences"}`;
+
   try {
     const data = await robustFetch({
       method: 'post',
-      url: 'https://eventregistry.org/api/v1/article/getArticles',
-      data: query
-    }, { stage: 'event-registry' });
+      url: GROQ_API_URL,
+      data: {
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens: 500,
+        response_format: { type: 'json_object' }
+      },
+      headers: { Authorization: `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
+    }, { stage: 'claim-verification' });
 
-    return (data.articles?.results || []).map(a => ({
-      title: a.title,
+    const parsed = JSON.parse(data.choices[0].message.content);
+    let verdict = String(parsed.verdict || 'UNVERIFIED').toUpperCase();
+    if (!['SUPPORTED', 'REFUTED', 'UNVERIFIED'].includes(verdict)) verdict = 'UNVERIFIED';
+    const cited = (Array.isArray(parsed.articleNumbers) ? parsed.articleNumbers : [])
+      .map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= used.length);
+
+    if (verdict !== 'UNVERIFIED' && cited.length === 0) {
+      return unverified(claim, 'The model gave a verdict without citing any article, so it was discarded.');
+    }
+
+    return {
+      claim: claim.claim,
+      verdict,
+      confidence: verdict === 'UNVERIFIED' ? 0 : Math.min(100, Math.max(0, Number(parsed.confidence) || 50)),
+      evidence: Array.isArray(parsed.evidence) ? parsed.evidence.slice(0, 3).map(String) : [],
+      citedArticles: cited.map(n => ({ title: used[n - 1].title, url: used[n - 1].url, source: used[n - 1].source })),
+      reasoning: String(parsed.reasoning || 'Analysis complete.'),
+      category: claim.category || 'General'
+    };
+  } catch (e) {
+    return unverified(claim, 'Verification failed due to a processing error.');
+  }
+}
+
+function deduplicateArticles(articles) {
+  const seen = new Set();
+  return articles.filter(art => {
+    const key = art.url || art.title;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Calls Event Registry. Never throws; records failures in erState. */
+async function fetchArticlesFromER(query, erState = { errors: [], calls: 0 }) {
+  erState.calls++;
+  try {
+    const data = await robustFetch({ method: 'post', url: ER_URL, data: query }, { stage: 'event-registry', retries: 2 });
+    // Event Registry reports many failures (bad key, quota) as HTTP 200 with an `error` field.
+    if (data && data.error) {
+      erState.errors.push(String(data.error).slice(0, 120));
+      console.warn('[event-registry] API error:', data.error);
+      return [];
+    }
+    return (data?.articles?.results || []).map(a => ({
+      title: a.title || '',
       url: a.url,
       source: a.source?.title || 'Institutional Source',
       domain: (a.source?.uri || '').toLowerCase(),
       body: (a.body || '').slice(0, 3000),
-      publishDate: a.dateTime
+      image: a.image || null,
+      publishDate: a.dateTime || a.date
     }));
-  } catch (e) { return []; }
+  } catch (e) {
+    erState.errors.push(e.response?.status ? `http_${e.response.status}` : e.message);
+    return [];
+  }
 }
 
-async function processEvidence(articles, intelligence) {
+async function processEvidence(articles, intelligence, claimVerifications = []) {
   const groqKey = process.env.GROQ_API_KEY;
   const summary = intelligence.humanizedSummary || intelligence.summary || '';
+  const entities = intelligence.extractedEntities || intelligence.entities || [];
+  const keywords = intelligence.extractedKeywords || intelligence.keywords || [];
 
-  // 1. Semantic Ranking & Filtering
+  // Rank by real topical overlap; a trusted domain is a bonus, never enough on its own.
   const ranked = articles.map(art => {
-    let score = 0;
-    const domain = art.domain.replace('www.', '');
-    if (PREMIUM_SOURCES.has(domain)) score += 40;
-    
-    // Semantic Overlap Check
-    const title = art.title.toLowerCase();
-    const body = art.body.toLowerCase();
-    
-    // Check entities
-    const matchedEntities = (intelligence.entities || []).filter(e => title.includes(e.toLowerCase()) || body.includes(e.toLowerCase()));
-    score += (matchedEntities.length * 15);
-
-    // Check keywords
-    const matchedKeywords = (intelligence.keywords || []).filter(k => title.includes(k.toLowerCase()));
-    score += (matchedKeywords.length * 10);
-
-    // Contextual relevance
-    if (summary && title.split(' ').some(word => word.length > 4 && summary.toLowerCase().includes(word))) {
-      score += 20;
-    }
-
-    return { ...art, relevanceScore: score, matchedEntities, matchedKeywords };
+    const title = (art.title || '').toLowerCase();
+    const body = (art.body || '').toLowerCase();
+    const matchedEntities = entities.filter(e => typeof e === 'string' && (title.includes(e.toLowerCase()) || body.includes(e.toLowerCase())));
+    const matchedKeywords = keywords.filter(k => typeof k === 'string' && title.includes(k.toLowerCase()));
+    let score = matchedEntities.length * 15 + matchedKeywords.length * 10;
+    if (summary && title.split(' ').some(w => w.length > 4 && summary.toLowerCase().includes(w))) score += 20;
+    const premium = isPremium(art.domain);
+    if (score > 0 && premium) score += 40;
+    return { ...art, relevanceScore: score, matchedEntities, matchedKeywords, trusted: premium };
   })
-  .filter(art => art.relevanceScore > 30) // Filter out weak matches
-  .sort((a, b) => b.relevanceScore - a.relevanceScore)
-  .slice(0, 8);
+    .filter(a => a.relevanceScore > 30)
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, 8);
 
-  // 2. High-Fidelity Summarization
-  const articleSummaries = await Promise.all(
-    ranked.map(async (art) => {
-      const summaryResult = await summarizeArticle(art, summary, groqKey);
-      return { 
-        ...art, 
-        aiSummary: summaryResult.text, 
-        stance: summaryResult.stance,
-        alignmentStatus: summaryResult.alignmentStatus || (summaryResult.stance === 'support' ? 'Aligned' : summaryResult.stance === 'refute' ? 'Contradicting' : 'Neutral')
-      };
-    })
-  );
+  const articleSummaries = await Promise.all(ranked.map(async (art) => {
+    const s = await summarizeArticle(art, summary, groqKey, claimVerifications);
+    return {
+      ...art,
+      aiSummary: s.text,
+      stance: s.stance,
+      alignmentStatus: s.alignmentStatus || (s.stance === 'support' ? 'Aligned' : s.stance === 'refute' ? 'Contradicting' : 'Neutral')
+    };
+  }));
 
   const supports = articleSummaries.filter(a => a.stance === 'support');
   const refutes = articleSummaries.filter(a => a.stance === 'refute');
-  
+  const trustedCoverage = articleSummaries.filter(a => a.trusted).length;
+
   let consensus = 'insufficient_coverage';
   if (refutes.length > 0 && refutes.length >= supports.length) consensus = 'contradicted';
   else if (supports.length >= 2) consensus = 'strongly_supported';
@@ -314,7 +306,8 @@ async function processEvidence(articles, intelligence) {
     supportingArticles: supports,
     contradictingArticles: refutes,
     narrativeAlignmentScore: calculateAlignmentScore(articleSummaries),
-    trustedConsensus: consensus
+    trustedConsensus: consensus,
+    sourceMetadata: { trustedCoverage, totalArticles: articleSummaries.length }
   };
 }
 
@@ -322,37 +315,27 @@ async function summarizeArticle(article, context, groqKey) {
   if (!groqKey) return { text: article.title, stance: 'neutral' };
 
   const prompt = `
-    Analyze this article against the investigative summary: "${context.slice(0, 600)}"
-    Article Title: ${article.title}
-    Article Content: ${article.body.slice(0, 1800)}
+Analyze this article against the investigative summary: "${context.slice(0, 600)}"
+Article Title: ${article.title}
+Article Content: ${(article.body || '').slice(0, 1800)}
 
-    TASK:
-    1. Summarize how this article relates to the summary narrative in 1-2 concise sentences.
-    2. Identify the stance (support|refute|neutral).
-    3. State why it matches (e.g. "Directly confirms claim X", "Provides alternative context for Y").
+TASK
+1. Summarize in 1-2 sentences how the article relates to the summary.
+2. stance: "support" only if the article confirms facts in the summary, "refute" only if it directly conflicts with them, otherwise "neutral" (same topic is neutral).
 
-    RETURN JSON ONLY:
-    { 
-      "text": "The investigative summary...", 
-      "stance": "support|refute|neutral",
-      "alignmentStatus": "Aligned|Contradicting|Contextual"
-    }
-  `;
+RETURN JSON ONLY:
+{"text":"...","stance":"support|refute|neutral","alignmentStatus":"Aligned|Contradicting|Contextual"}`;
 
   try {
     const data = await robustFetch({
       method: 'post',
       url: GROQ_API_URL,
-      data: { 
-        model: GROQ_MODEL, 
-        messages: [{ role: 'user', content: prompt }], 
-        temperature: 0.1, 
-        response_format: { type: "json_object" } 
-      },
-      headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
-    }, { stage: 'article-semantic-alignment' });
-
-    return JSON.parse(data.choices[0].message.content);
+      data: { model: GROQ_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 300, response_format: { type: 'json_object' } },
+      headers: { Authorization: `Bearer ${groqKey}`, 'Content-Type': 'application/json' }
+    }, { stage: 'article-semantic-alignment', retries: 1 });
+    const parsed = JSON.parse(data.choices[0].message.content);
+    if (!['support', 'refute', 'neutral'].includes(parsed.stance)) parsed.stance = 'neutral';
+    return parsed;
   } catch (e) {
     return { text: article.title, stance: 'neutral' };
   }
@@ -364,8 +347,26 @@ function calculateAlignmentScore(articles) {
   return Math.round(sum / articles.length);
 }
 
-function getEmptyEvidenceResult(reason) {
-  return { articleSummaries: [], narrativeAlignmentScore: 50, trustedConsensus: 'insufficient_coverage' };
+function claimsOf(intelligence) {
+  return (intelligence.extractedClaims || intelligence.claims || []).filter(c => c && c.claim).slice(0, 5);
 }
 
-module.exports = { analyzeLiveNarrative };
+function getEmptyEvidenceResult(retrievalStatus, claims = []) {
+  const why = retrievalStatus === 'er_key_missing'
+    ? 'Live news retrieval is not configured (ER_API_KEY missing).'
+    : retrievalStatus === 'no_articles'
+      ? 'No relevant news articles were found for this claim.'
+      : `Live news retrieval failed (${retrievalStatus}).`;
+  return {
+    articleSummaries: [],
+    supportingArticles: [],
+    contradictingArticles: [],
+    claimVerifications: claims.map(c => unverified(c, why)),
+    narrativeAlignmentScore: 50,
+    trustedConsensus: 'insufficient_coverage',
+    sourceMetadata: { trustedCoverage: 0, totalArticles: 0 },
+    retrievalStatus
+  };
+}
+
+module.exports = { analyzeLiveNarrative, fetchArticlesFromER, verifyClaimAgainstArticles, claimSearchTerms };

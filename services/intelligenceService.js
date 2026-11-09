@@ -12,7 +12,7 @@ const { generateCleanSummary, generateFallbackSummary } = require('./cleanSummar
 const { extractKeywordsAndEntities, localFallbackExtract } = require('./keywordExtractionEngine');
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL   = 'llama-3.1-8b-instant';
+const GROQ_MODEL   = (process.env.GROQ_MODEL || 'openai/gpt-oss-20b');
 
 /**
  * Main entry point for Phase 2 Intelligence.
@@ -183,7 +183,8 @@ async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResu
 
     return {
       // Legacy Fields (strictly required by credibilityService, analyzeController, etc.)
-      summary: parsed.videoSummary || cleanSummaryResult.cleanSummary,
+      // The faithful summary comes from the dedicated summary engine, not from the claim-extraction call.
+      summary: cleanSummaryResult.cleanSummary,
       meaning: parsed.meaning || cleanSummaryResult.contextualNarrative.split('.')[0] || cleanSummaryResult.cleanSummary.split('.')[0],
       entities: keywordResult.extractedEntities,
       keywords: keywordResult.extractedKeywords,
@@ -196,12 +197,13 @@ async function extractNarrativeIntelligence(text, narrativeMap, cleanSummaryResu
 
       // New Production Engine Fields
       cleanSummary: cleanSummaryResult.cleanSummary,
+      keyPoints: cleanSummaryResult.keyPoints || [],
       humanizedSummary: cleanSummaryResult.cleanSummary,
       contextualNarrative: cleanSummaryResult.contextualNarrative,
       extractedKeywords: keywordResult.extractedKeywords,
       extractedEntities: keywordResult.extractedEntities,
       extractedClaims: parsed.extractedClaims || [],
-      videoSummary: parsed.videoSummary || cleanSummaryResult.cleanSummary,
+      videoSummary: cleanSummaryResult.cleanSummary,
       narrativeTopics: keywordResult.narrativeTopics,
       retrievalSignals: keywordResult.retrievalSignals,
       keywordRelevance: keywordResult.keywordRelevance,

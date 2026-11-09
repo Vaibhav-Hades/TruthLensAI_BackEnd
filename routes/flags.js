@@ -1,6 +1,8 @@
 const express = require('express')
 const router  = express.Router()
 const { saveFlag, getFlagCount, getAllFlags } = require('../controllers/flagsController')
+const requireDb = require('../middleware/requireDb')
+router.use('/flags', requireDb)
 
 router.post('/flags',        saveFlag)
 router.get('/flags/count',   getFlagCount)

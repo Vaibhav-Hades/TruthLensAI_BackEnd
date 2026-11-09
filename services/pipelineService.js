@@ -9,6 +9,9 @@ const { fetchTranscriptWithFallback } = require('./transcriptService');
 const { cleanTranscript } = require('./transcriptCleaningService');
 const { chunkContent } = require('./chunkingService');
 const axios = require('axios');
+const { assertPublicUrl, appError } = require('../utils/inputValidation');
+
+const MAX_ANALYSIS_CHARS = parseInt(process.env.MAX_ANALYSIS_CHARS || '20000', 10);
 
 async function runPhase1Pipeline(input) {
   const startTime = Date.now();
@@ -18,9 +21,13 @@ async function runPhase1Pipeline(input) {
 
   let rawTranscript = '';
   let transcriptMeta = {};
+  let truncated = false;
 
   try {
     if (detection.type === 'video') {
+      if (!detection.videoId) {
+        throw appError('Only YouTube video links are supported for video analysis. For other platforms, paste the transcript or caption as text.', 'UNSUPPORTED_CONTENT', 422);
+      }
       const result = await fetchTranscriptWithFallback(detection.normalizedInput);
       rawTranscript = result.transcript;
       transcriptMeta = {
@@ -28,7 +35,8 @@ async function runPhase1Pipeline(input) {
         languageDetected: result.languageDetected,
         transcriptConfidence: result.transcriptConfidence,
         fallbackUsed: result.fallbackUsed,
-        audioQuality: result.audioQuality || 'medium'
+        audioQuality: result.audioQuality || 'medium',
+        metadataOnly: !!result.metadataOnly
       };
     } 
     else if (detection.type === 'article') {
@@ -42,6 +50,10 @@ async function runPhase1Pipeline(input) {
     } 
     else {
       rawTranscript = detection.normalizedInput;
+      if (rawTranscript.length > MAX_ANALYSIS_CHARS) {
+        rawTranscript = rawTranscript.slice(0, MAX_ANALYSIS_CHARS);
+        truncated = true;
+      }
       transcriptMeta = {
         transcriptSource: 'manual_input',
         languageDetected: 'auto',
@@ -51,7 +63,7 @@ async function runPhase1Pipeline(input) {
     }
 
     if (!rawTranscript || rawTranscript.trim().length < 20) {
-      throw new Error('Extracted content is too short or empty.');
+      throw appError('The extracted content is too short or empty to analyze.', 'CONTENT_TOO_SHORT', 422);
     }
   } catch (err) {
     if (!err.errorCode) err.errorCode = 'CONTENT_EXTRACTION_FAILED';
@@ -70,6 +82,7 @@ async function runPhase1Pipeline(input) {
     metadata: {
       ...detection,
       ...transcriptMeta,
+      truncated,
       totalChunks: chunkingResult.totalChunks,
       estimatedTokens: chunkingResult.estimatedTokens,
       processingTimeMs: processingTime,
@@ -80,65 +93,74 @@ async function runPhase1Pipeline(input) {
 }
 
 async function fetchArticleText(url) {
+  await assertPublicUrl(url);
+  let response;
   try {
-    const response = await axios.get(url, {
+    response = await axios.get(url, {
       timeout: 20000,
-      headers: { 
+      maxRedirects: 3,
+      maxContentLength: 5 * 1024 * 1024,
+      responseType: 'text',
+      transformResponse: [d => d],
+      beforeRedirect: (opts) => {
+        // Block redirects into localhost / private literals (full DNS re-check is done on the first hop).
+        if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.0\.0\.0)/i.test(opts.hostname || '')) {
+          throw new Error('Redirect to a private address blocked');
+        }
+      },
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
     });
-
-    let html = response.data || '';
-    
-    // Clean HTML
-    html = html
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<nav[\s\S]*?<\/nav>/gi, '')
-      .replace(/<footer[\s\S]*?<\/footer>/gi, '')
-      .replace(/<header[\s\S]*?<\/header>/gi, '')
-      .replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
-
-    // Extract core content (prioritize semantic tags)
-    let body = '';
-    const selectors = [/<article[^>]*>([\s\S]*?)<\/article>/i, /<main[^>]*>([\s\S]*?)<\/main>/i, /<div id="content"[^>]*>([\s\S]*?)<\/div>/i];
-    
-    for (const regex of selectors) {
-      const match = html.match(regex);
-      if (match) {
-        body = match[1];
-        break;
-      }
-    }
-
-    if (!body) {
-      const pRegex = /<p[^>]*>([\s\S]*?)<\/p>/gi;
-      let m;
-      const paragraphs = [];
-      while ((m = pRegex.exec(html)) !== null) {
-        const t = m[1].replace(/<[^>]+>/g, ' ').trim();
-        if (t.length > 50) paragraphs.push(t);
-      }
-      body = paragraphs.join('\n');
-    }
-
-    const cleaned = body
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-
-    if (cleaned.length < 100) {
-      throw new Error('Article too short');
-    }
-
-    return cleaned.slice(0, 15000);
   } catch (err) {
-    const error = new Error('Article retrieval failed. The site may be protected or restricted.');
-    error.errorCode = 'ARTICLE_FETCH_FAILED';
-    throw error;
+    throw appError('Article retrieval failed. The site may be unreachable, protected, or restricted.', 'ARTICLE_FETCH_FAILED', 422);
   }
+
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
+  if (contentType && !/(text\/html|application\/xhtml|text\/plain)/.test(contentType)) {
+    throw appError('That link does not point to a readable web page (PDF, image or file links are not supported).', 'UNSUPPORTED_CONTENT', 422);
+  }
+
+  let html = String(response.data || '');
+  if (/text\/plain/.test(contentType)) {
+    const plain = html.replace(/\s{2,}/g, ' ').trim();
+    if (plain.length < 100) throw appError('The page has too little readable text to analyze.', 'CONTENT_TOO_SHORT', 422);
+    return plain.slice(0, MAX_ANALYSIS_CHARS);
+  }
+
+  html = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(script|style|nav|footer|header|iframe|aside|form|noscript|svg)[\s\S]*?<\/>/gi, '');
+
+  let body = '';
+  const selectors = [/<article[^>]*>([\s\S]*?)<\/article>/i, /<main[^>]*>([\s\S]*?)<\/main>/i];
+  for (const regex of selectors) {
+    const match = html.match(regex);
+    if (match && match[1].replace(/<[^>]+>/g, '').trim().length > 200) { body = match[1]; break; }
+  }
+  if (!body) {
+    const pRegex = /<p[^>]*>([\s\S]*?)<\/p>/gi;
+    let m;
+    const paragraphs = [];
+    while ((m = pRegex.exec(html)) !== null) {
+      const t = m[1].replace(/<[^>]+>/g, ' ').trim();
+      if (t.length > 50) paragraphs.push(t);
+    }
+    body = paragraphs.join(' ');
+  }
+
+  const title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+  const decode = (t) => t
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  const cleaned = decode(body.replace(/<[^>]+>/g, ' ')).replace(/\s{2,}/g, ' ').trim();
+
+  if (cleaned.length < 100) {
+    throw appError('Could not find readable article text on that page. It may be paywalled or rendered by JavaScript.', 'CONTENT_TOO_SHORT', 422);
+  }
+  const head = title.trim() ? decode(title.trim()) + '. ' : '';
+  return (head + cleaned).slice(0, MAX_ANALYSIS_CHARS);
 }
 
 module.exports = { runPhase1Pipeline };

@@ -75,7 +75,7 @@ async function performFullVerification(pipelineResult) {
         ...pipelineResult.metadata,
         processingTimeMs: durationMs,
         pipelineVersion: 'V2-Simplified-Stable',
-        model: 'llama-3.1-8b-instant'
+        model: (process.env.GROQ_MODEL || 'openai/gpt-oss-20b')
       }
     };
 
